@@ -117,6 +117,11 @@ typedef struct {
     ngx_str_t                      ssl_crl;
     ngx_array_t                   *ssl_conf_commands;
 #endif
+
+#if (NGX_HTTP_V2)
+    ngx_str_t                      host;
+    ngx_uint_t                     host_set;
+#endif
 } ngx_http_proxy_loc_conf_t;
 
 

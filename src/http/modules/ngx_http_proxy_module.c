@@ -8,6 +8,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_http_proxy_module.h>
 
 
 #define  NGX_HTTP_PROXY_COOKIE_SECURE           0x0001
@@ -161,6 +162,9 @@ static ngx_conf_post_t  ngx_http_proxy_ssl_conf_command_post =
 static ngx_conf_enum_t  ngx_http_proxy_http_version[] = {
     { ngx_string("1.0"), NGX_HTTP_VERSION_10 },
     { ngx_string("1.1"), NGX_HTTP_VERSION_11 },
+#if (NGX_HTTP_V2)
+    { ngx_string("2.0"), NGX_HTTP_VERSION_20 },
+#endif
     { ngx_null_string, 0 }
 };
 
@@ -830,6 +834,14 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     ngx_http_proxy_main_conf_t  *pmcf;
 #endif
 
+    plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+
+#if (NGX_HTTP_V2)
+    if (plcf->http_version == NGX_HTTP_VERSION_20) {
+        return ngx_http_v2_proxy_handler(r);
+    }
+#endif
+
     if (ngx_http_upstream_create(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -840,8 +852,6 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     }
 
     ngx_http_set_ctx(r, ctx, ngx_http_proxy_module);
-
-    plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
 
     u = r->upstream;
 
@@ -3456,6 +3466,8 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
      *     conf->ssl_ciphers = { 0, NULL };
      *     conf->ssl_trusted_certificate = { 0, NULL };
      *     conf->ssl_crl = { 0, NULL };
+     *     conf->host = { 0, NULL };
+     *     conf->host_set = 0;
      */
 
     conf->upstream.store = NGX_CONF_UNSET;
@@ -3981,6 +3993,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #if (NGX_HTTP_SSL)
         conf->ssl = prev->ssl;
 #endif
+#if (NGX_HTTP_SSL)
+        conf->host = prev->host;
+#endif
     }
 
     if (clcf->lmt_excpt && clcf->handler == NULL
@@ -4020,6 +4035,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #if (NGX_HTTP_CACHE)
         conf->headers_cache = prev->headers_cache;
 #endif
+#if (NGX_HTTP_V2)
+        conf->host_set = prev->host_set;
+#endif
     }
 
     rc = ngx_http_proxy_init_headers(cf, conf, &conf->headers,
@@ -4051,6 +4069,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         prev->headers = conf->headers;
 #if (NGX_HTTP_CACHE)
         prev->headers_cache = conf->headers_cache;
+#endif
+#if (NGX_HTTP_V2)
+        conf->host_set = prev->host_set;
 #endif
     }
 
@@ -4103,6 +4124,14 @@ ngx_http_proxy_init_headers(ngx_conf_t *cf, ngx_http_proxy_loc_conf_t *conf,
 
         src = conf->headers_source->elts;
         for (i = 0; i < conf->headers_source->nelts; i++) {
+
+#if (NGX_HTTP_V2)
+            if (src[i].key.len == 4
+                && ngx_strncasecmp(src[i].key.data, (u_char *) "Host", 4) == 0)
+            {
+                conf->host_set = 1;
+            }
+#endif
 
             s = ngx_array_push(&headers_merged);
             if (s == NULL) {
@@ -4342,6 +4371,27 @@ ngx_http_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     plcf->url = *url;
+
+#if (NGX_HTTP_V2)
+
+    if (plcf->http_version == NGX_HTTP_VERSION_20) {
+
+        if (u.family != AF_UNIX) {
+
+            if (u.no_port) {
+                plcf->host = u.host;
+
+            } else {
+                plcf->host.len = u.host.len + 1 + u.port_text.len;
+                plcf->host.data = u.host.data;
+            }
+
+        } else {
+            ngx_str_set(&plcf->host, "localhost");
+        }
+    }
+
+#endif
 
     return NGX_CONF_OK;
 }
@@ -5273,6 +5323,21 @@ ngx_http_proxy_set_ssl(ngx_conf_t *cf, ngx_http_proxy_loc_conf_t *plcf)
     {
         return NGX_ERROR;
     }
+
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+
+    if (plcf->http_version == NGX_HTTP_VERSION_20) {
+        if (SSL_CTX_set_alpn_protos(plcf->upstream.ssl->ctx,
+                                    (u_char *) "\x02h2", 3)
+            != 0)
+        {
+            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                          "SSL_CTX_set_alpn_protos() failed");
+            return NGX_ERROR;
+        }
+    }
+
+#endif
 
     if (ngx_ssl_conf_commands(cf, plcf->upstream.ssl, plcf->ssl_conf_commands)
         != NGX_OK)
