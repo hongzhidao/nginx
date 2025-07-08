@@ -5324,21 +5324,6 @@ ngx_http_proxy_set_ssl(ngx_conf_t *cf, ngx_http_proxy_loc_conf_t *plcf)
         return NGX_ERROR;
     }
 
-#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
-
-    if (plcf->http_version == NGX_HTTP_VERSION_20) {
-        if (SSL_CTX_set_alpn_protos(plcf->upstream.ssl->ctx,
-                                    (u_char *) "\x02h2", 3)
-            != 0)
-        {
-            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
-                          "SSL_CTX_set_alpn_protos() failed");
-            return NGX_ERROR;
-        }
-    }
-
-#endif
-
     if (ngx_ssl_conf_commands(cf, plcf->upstream.ssl, plcf->ssl_conf_commands)
         != NGX_OK)
     {

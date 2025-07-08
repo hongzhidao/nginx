@@ -266,6 +266,8 @@ ngx_http_v2_proxy_handler(ngx_http_request_t *r)
     u->input_filter = ngx_http_v2_proxy_filter;
     u->input_filter_ctx = ctx;
 
+    ngx_str_set(&u->ssl_alpn_protocol, NGX_HTTP_V2_ALPN_PROTO);
+
     r->request_body_no_buffering = 1;
 
     rc = ngx_http_read_client_request_body(r, ngx_http_upstream_init);
