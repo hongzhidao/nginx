@@ -186,6 +186,12 @@ struct ngx_connection_s {
     unsigned            idle:1;
     unsigned            reusable:1;
     unsigned            close:1;
+
+    /*
+     * the fd and events belong to another owner (UDP/QUIC datagram
+     * connections, per-stream connections of a multiplexed upstream):
+     * the closer must not shut down SSL or destroy c->pool for it
+     */
     unsigned            shared:1;
 
     unsigned            sendfile:1;

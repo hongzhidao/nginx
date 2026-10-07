@@ -37,7 +37,20 @@ typedef struct {
 
     ngx_http_upstream_conf_t          *tag;
 
+    void                              *mux;     /* opaque, never dereferenced */
+    ngx_uint_t                         active;  /* streams in flight on mux */
+
 } ngx_http_upstream_keepalive_cache_t;
+
+
+/* per-connection record of a multiplexed connection kept in the cache */
+
+typedef struct {
+    ngx_http_upstream_keepalive_cache_t  *item;
+    ngx_connection_t                     *connection;
+    ngx_event_handler_pt                  read_handler;
+    ngx_event_handler_pt                  write_handler;
+} ngx_http_upstream_keepalive_mux_t;
 
 
 typedef struct {
@@ -57,6 +70,14 @@ typedef struct {
 
     ngx_event_notify_peer_pt           original_notify;
 
+    /* the multiplexed connection this request holds a stream on, if any */
+    ngx_http_upstream_keepalive_cache_t  *item;
+    ngx_connection_t                  *mux_conn;
+    ngx_uint_t                         surplus; /* the balancer slot taken by
+                                                 * get() is not needed: the
+                                                 * connection already holds one
+                                                 */
+
 } ngx_http_upstream_keepalive_peer_data_t;
 
 
@@ -67,9 +88,22 @@ static ngx_int_t ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc,
 static void ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t state);
 
+static ngx_uint_t ngx_http_upstream_keepalive_reusable(
+    ngx_http_upstream_keepalive_peer_data_t *kp, ngx_connection_t *c,
+    ngx_uint_t state);
+static void ngx_http_upstream_keepalive_idle(
+    ngx_http_upstream_keepalive_peer_data_t *kp, ngx_peer_connection_t *pc,
+    ngx_connection_t *c, ngx_http_upstream_keepalive_cache_t *item);
 static void ngx_http_upstream_keepalive_dummy_handler(ngx_event_t *ev);
 static void ngx_http_upstream_keepalive_close_handler(ngx_event_t *ev);
+static void ngx_http_upstream_keepalive_mux_read_handler(ngx_event_t *ev);
+static void ngx_http_upstream_keepalive_mux_write_handler(ngx_event_t *ev);
 static void ngx_http_upstream_keepalive_close(ngx_connection_t *c);
+static ngx_queue_t *ngx_http_upstream_keepalive_idle_victim(
+    ngx_http_upstream_keepalive_srv_conf_t *conf);
+static ngx_http_upstream_keepalive_mux_t *
+    ngx_http_upstream_keepalive_find_mux(ngx_connection_t *c);
+static void ngx_http_upstream_keepalive_mux_cleanup(void *data);
 
 #if (NGX_HTTP_SSL)
 static ngx_int_t ngx_http_upstream_keepalive_set_session(
@@ -177,6 +211,9 @@ ngx_http_upstream_init_keepalive_peer(ngx_http_request_t *r,
 
     kp->conf = kcf;
     kp->upstream = r->upstream;
+    kp->item = NULL;
+    kp->mux_conn = NULL;
+    kp->surplus = 0;
     kp->data = r->upstream->peer.data;
     kp->original_get_peer = r->upstream->peer.get;
     kp->original_free_peer = r->upstream->peer.free;
@@ -208,6 +245,7 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
     ngx_http_upstream_keepalive_cache_t      *item;
 
     ngx_int_t          rc;
+    ngx_uint_t         busy;
     ngx_queue_t       *q, *cache;
     ngx_connection_t  *c;
 
@@ -224,6 +262,7 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
 
     /* search cache for suitable connection */
 
+    busy = 0;
     cache = &kp->conf->cache;
 
     for (q = ngx_queue_head(cache);
@@ -237,10 +276,30 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
             continue;
         }
 
+        if (item->mux != NULL
+            && (c->requests >= kp->conf->requests
+                || ngx_current_msec - c->start_time > kp->conf->time))
+        {
+            continue;
+        }
+
         if (ngx_memn2cmp((u_char *) &item->sockaddr, (u_char *) pc->sockaddr,
                          item->socklen, pc->socklen)
             == 0)
         {
+            if (item->mux != NULL) {
+
+                /* stays in the cache, shared by all streams */
+
+                busy = item->active++;
+
+                kp->item = item;
+                kp->mux_conn = c;
+                kp->surplus = busy != 0;
+
+                goto found;
+            }
+
             ngx_queue_remove(q);
             ngx_queue_insert_head(&kp->conf->free, q);
 
@@ -255,16 +314,18 @@ found:
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "get keepalive peer: using connection %p", c);
 
-    c->idle = 0;
-    c->sent = 0;
-    c->data = NULL;
-    c->log = pc->log;
-    c->read->log = pc->log;
-    c->write->log = pc->log;
-    c->pool->log = pc->log;
+    if (!busy) {
+        c->idle = 0;
+        c->sent = 0;
+        c->data = NULL;
+        c->log = pc->log;
+        c->read->log = pc->log;
+        c->write->log = pc->log;
+        c->pool->log = pc->log;
 
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
+        if (c->read->timer_set) {
+            ngx_del_timer(c->read);
+        }
     }
 
     pc->connection = c;
@@ -288,43 +349,53 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "free keepalive peer");
 
+    u = kp->upstream;
+
+    item = kp->item;
+    c = kp->mux_conn;
+
+    kp->item = NULL;
+    kp->mux_conn = NULL;
+    kp->surplus = 0;
+
+    if (item != NULL && item->mux != NULL && item->connection == c) {
+
+        /*
+         * The request was a stream of a multiplexed connection.  While other
+         * streams remain the connection stays as it is and keeps its single
+         * balancer slot (round-robin conns/fails and least_conn count
+         * connections, not streams): nothing to do here.  With the last
+         * stream gone the usual checks decide whether the idle connection
+         * is kept or closed, and the slot is given back once.
+         */
+
+        if (item->active) {
+            item->active--;
+        }
+
+        if (item->active > 0) {
+            return;
+        }
+
+        if (!ngx_http_upstream_keepalive_reusable(kp, c, state)) {
+            pc->connection = NULL;
+            ngx_http_upstream_keepalive_close(c);
+            goto invalid;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "free keepalive peer: keeping connection %p", c);
+
+        ngx_http_upstream_keepalive_idle(kp, pc, c, item);
+
+        goto invalid;
+    }
+
     /* cache valid connections */
 
-    u = kp->upstream;
     c = pc->connection;
 
-    if (state & NGX_PEER_FAILED
-        || c == NULL
-        || c->read->eof
-        || c->read->error
-        || c->read->timedout
-        || c->write->error
-        || c->write->timedout)
-    {
-        goto invalid;
-    }
-
-    if (c->requests >= kp->conf->requests) {
-        goto invalid;
-    }
-
-    if (ngx_current_msec - c->start_time > kp->conf->time) {
-        goto invalid;
-    }
-
-    if (!u->keepalive) {
-        goto invalid;
-    }
-
-    if (!u->request_body_sent) {
-        goto invalid;
-    }
-
-    if (ngx_terminate || ngx_exiting) {
-        goto invalid;
-    }
-
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+    if (!ngx_http_upstream_keepalive_reusable(kp, c, state)) {
         goto invalid;
     }
 
@@ -333,7 +404,15 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 
     if (ngx_queue_empty(&kp->conf->free)) {
 
-        q = ngx_queue_last(&kp->conf->cache);
+        q = ngx_http_upstream_keepalive_idle_victim(kp->conf);
+
+        if (q == NULL) {
+
+            /* every cached connection has streams in flight */
+
+            goto invalid;
+        }
+
         ngx_queue_remove(q);
 
         item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
@@ -352,6 +431,73 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     item->connection = c;
     item->tag = u->conf;
 
+    ngx_http_upstream_keepalive_idle(kp, pc, c, item);
+
+invalid:
+
+    kp->original_free_peer(pc, kp->data, state);
+}
+
+
+/* may the connection stay in the cache after the request */
+
+static ngx_uint_t
+ngx_http_upstream_keepalive_reusable(
+    ngx_http_upstream_keepalive_peer_data_t *kp, ngx_connection_t *c,
+    ngx_uint_t state)
+{
+    ngx_http_upstream_t  *u;
+
+    u = kp->upstream;
+
+    if (state & NGX_PEER_FAILED
+        || c == NULL
+        || c->read->eof
+        || c->read->error
+        || c->read->timedout
+        || c->write->error
+        || c->write->timedout)
+    {
+        return 0;
+    }
+
+    if (c->requests >= kp->conf->requests) {
+        return 0;
+    }
+
+    if (ngx_current_msec - c->start_time > kp->conf->time) {
+        return 0;
+    }
+
+    if (!u->keepalive) {
+        return 0;
+    }
+
+    if (!u->request_body_sent) {
+        return 0;
+    }
+
+    if (ngx_terminate || ngx_exiting) {
+        return 0;
+    }
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* hand the connection over to the cache; the idle timer starts here */
+
+static void
+ngx_http_upstream_keepalive_idle(ngx_http_upstream_keepalive_peer_data_t *kp,
+    ngx_peer_connection_t *pc, ngx_connection_t *c,
+    ngx_http_upstream_keepalive_cache_t *item)
+{
+    ngx_http_upstream_keepalive_mux_t  *m;
+
     pc->connection = NULL;
 
     c->read->delayed = 0;
@@ -361,8 +507,26 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
         ngx_del_timer(c->write);
     }
 
-    c->write->handler = ngx_http_upstream_keepalive_dummy_handler;
-    c->read->handler = ngx_http_upstream_keepalive_close_handler;
+    /*
+     * An idle multiplexed connection is still a live protocol session: the
+     * peer may send PING, SETTINGS or GOAWAY, which are not garbage.
+     */
+
+    m = ngx_http_upstream_keepalive_find_mux(c);
+
+    if (m != NULL && m->item == item && m->read_handler != NULL) {
+        c->read->handler = ngx_http_upstream_keepalive_mux_read_handler;
+
+    } else {
+        c->read->handler = ngx_http_upstream_keepalive_close_handler;
+    }
+
+    if (m != NULL && m->item == item && m->write_handler != NULL) {
+        c->write->handler = ngx_http_upstream_keepalive_mux_write_handler;
+
+    } else {
+        c->write->handler = ngx_http_upstream_keepalive_dummy_handler;
+    }
 
     c->data = item;
     c->idle = 1;
@@ -375,12 +539,58 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
 
     if (c->read->ready) {
-        ngx_http_upstream_keepalive_close_handler(c->read);
+        c->read->handler(c->read);
+    }
+}
+
+
+/*
+ * Idle read event of a multiplexed connection: the session handler consumes
+ * what the peer sent and sets c->close if the connection is of no more use
+ * (GOAWAY, error, eof).  The idle timeout and c->close close it as usual.
+ */
+
+static void
+ngx_http_upstream_keepalive_mux_read_handler(ngx_event_t *ev)
+{
+    ngx_connection_t                   *c;
+    ngx_http_upstream_keepalive_mux_t  *m;
+
+    c = ev->data;
+
+    m = ngx_http_upstream_keepalive_find_mux(c);
+
+    if (m != NULL && m->read_handler != NULL
+        && !c->close && !c->read->timedout)
+    {
+        m->read_handler(ev);
+
+        if (!c->close) {
+            return;
+        }
     }
 
-invalid:
+    ngx_http_upstream_keepalive_close_handler(ev);
+}
 
-    kp->original_free_peer(pc, kp->data, state);
+
+static void
+ngx_http_upstream_keepalive_mux_write_handler(ngx_event_t *ev)
+{
+    ngx_connection_t                   *c;
+    ngx_http_upstream_keepalive_mux_t  *m;
+
+    c = ev->data;
+
+    m = ngx_http_upstream_keepalive_find_mux(c);
+
+    if (m != NULL && m->write_handler != NULL) {
+        m->write_handler(ev);
+    }
+
+    if (c->close) {
+        c->read->handler(c->read);
+    }
 }
 
 
@@ -455,6 +665,271 @@ ngx_http_upstream_keepalive_close(ngx_connection_t *c)
 
     ngx_destroy_pool(c->pool);
     ngx_close_connection(c);
+}
+
+
+/* the oldest cached connection that has no streams in flight, or NULL */
+
+static ngx_queue_t *
+ngx_http_upstream_keepalive_idle_victim(
+    ngx_http_upstream_keepalive_srv_conf_t *conf)
+{
+    ngx_queue_t                          *q;
+    ngx_http_upstream_keepalive_cache_t  *item;
+
+    for (q = ngx_queue_last(&conf->cache);
+         q != ngx_queue_sentinel(&conf->cache);
+         q = ngx_queue_prev(q))
+    {
+        item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
+
+        if (item->active == 0) {
+            return q;
+        }
+    }
+
+    return NULL;
+}
+
+
+static ngx_http_upstream_keepalive_mux_t *
+ngx_http_upstream_keepalive_find_mux(ngx_connection_t *c)
+{
+    ngx_pool_cleanup_t  *cln;
+
+    for (cln = c->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler == ngx_http_upstream_keepalive_mux_cleanup) {
+            return cln->data;
+        }
+    }
+
+    return NULL;
+}
+
+
+/* the connection is going away: do not leave a dangling cache entry */
+
+static void
+ngx_http_upstream_keepalive_mux_cleanup(void *data)
+{
+    ngx_queue_t                          *q;
+    ngx_http_upstream_keepalive_mux_t    *m = data;
+    ngx_http_upstream_keepalive_cache_t  *item;
+
+    item = m->item;
+
+    if (item == NULL || item->connection != m->connection) {
+
+        /* the entry was already recycled for another connection */
+
+        return;
+    }
+
+    for (q = ngx_queue_head(&item->conf->cache);
+         q != ngx_queue_sentinel(&item->conf->cache);
+         q = ngx_queue_next(q))
+    {
+        if (q == &item->queue) {
+            ngx_queue_remove(q);
+            ngx_queue_insert_head(&item->conf->free, q);
+            break;
+        }
+    }
+
+    item->connection = NULL;
+    item->mux = NULL;
+    item->active = 0;
+}
+
+
+/*
+ * Register (or update, or with mux == NULL drop) the multiplexed session of
+ * connection "c" in the keepalive cache.  A new entry is created with one
+ * stream in flight, so that a concurrent request can find the connection while
+ * it is in use.  Must be called while c->data is still the request that owns
+ * the connection.  Returns NGX_DECLINED if the connection cannot be shared
+ * (keepalive is not configured, or the cache is full of busy entries).
+ */
+
+ngx_int_t
+ngx_http_upstream_keepalive_set_mux(ngx_connection_t *c, void *mux,
+    ngx_event_handler_pt read_handler, ngx_event_handler_pt write_handler)
+{
+    ngx_queue_t                              *q;
+    ngx_uint_t                                cached;
+    ngx_http_request_t                       *r;
+    ngx_http_upstream_t                      *u;
+    ngx_pool_cleanup_t                       *cln;
+    ngx_http_upstream_keepalive_mux_t        *m;
+    ngx_http_upstream_keepalive_cache_t      *item;
+    ngx_http_upstream_keepalive_peer_data_t  *kp;
+
+    m = ngx_http_upstream_keepalive_find_mux(c);
+
+    if (m != NULL && m->item != NULL && m->item->connection == c) {
+
+        if (mux != NULL) {
+            m->item->mux = mux;
+            m->read_handler = read_handler;
+            m->write_handler = write_handler;
+            return NGX_OK;
+        }
+
+        ngx_http_upstream_keepalive_mux_cleanup(m);
+        m->item = NULL;
+
+        return NGX_OK;
+    }
+
+    if (mux == NULL) {
+        return NGX_OK;
+    }
+
+    r = c->data;
+
+    if (r == NULL || r->upstream == NULL) {
+        return NGX_DECLINED;
+    }
+
+    u = r->upstream;
+
+    /* get() may be wrapped by the caller, free() is not yet */
+
+    if (u->peer.free != ngx_http_upstream_free_keepalive_peer
+        || u->peer.sockaddr == NULL)
+    {
+        return NGX_DECLINED;
+    }
+
+    kp = u->peer.data;
+
+    /* pick the slot first, nothing is changed until it cannot fail */
+
+    if (ngx_queue_empty(&kp->conf->free)) {
+        q = ngx_http_upstream_keepalive_idle_victim(kp->conf);
+
+        if (q == NULL) {
+            return NGX_DECLINED;
+        }
+
+        cached = 1;
+
+    } else {
+        q = ngx_queue_head(&kp->conf->free);
+        cached = 0;
+    }
+
+    if (m == NULL) {
+        cln = ngx_pool_cleanup_add(c->pool,
+                                   sizeof(ngx_http_upstream_keepalive_mux_t));
+        if (cln == NULL) {
+            return NGX_ERROR;
+        }
+
+        m = cln->data;
+        m->item = NULL;
+        m->connection = c;
+        cln->handler = ngx_http_upstream_keepalive_mux_cleanup;
+    }
+
+    ngx_queue_remove(q);
+
+    item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
+
+    if (cached) {
+        ngx_http_upstream_keepalive_close(item->connection);
+    }
+
+    ngx_queue_insert_head(&kp->conf->cache, q);
+
+    item->connection = c;
+    item->tag = u->conf;
+    item->socklen = u->peer.socklen;
+    ngx_memcpy(&item->sockaddr, u->peer.sockaddr, u->peer.socklen);
+    item->mux = mux;
+    item->active = 1;
+
+    kp->item = item;
+    kp->mux_conn = c;
+    kp->surplus = 0;
+
+    m->item = item;
+    m->read_handler = read_handler;
+    m->write_handler = write_handler;
+
+    return NGX_OK;
+}
+
+
+void *
+ngx_http_upstream_keepalive_get_mux(ngx_connection_t *c)
+{
+    ngx_http_upstream_keepalive_mux_t  *m;
+
+    m = ngx_http_upstream_keepalive_find_mux(c);
+
+    if (m == NULL || m->item == NULL || m->item->connection != c) {
+        return NULL;
+    }
+
+    return m->item->mux;
+}
+
+
+/*
+ * The request joined the multiplexed connection that get() returned.  If the
+ * connection was already in use it holds a balancer slot, and the one get()
+ * has just taken for this request is given back right away.
+ */
+
+void
+ngx_http_upstream_keepalive_mux_joined(ngx_peer_connection_t *pc, void *data)
+{
+    ngx_uint_t                                tries;
+    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
+
+    if (!kp->surplus) {
+        return;
+    }
+
+    kp->surplus = 0;
+
+    tries = pc->tries;
+
+    kp->original_free_peer(pc, kp->data, 0);
+
+    pc->tries = tries;
+}
+
+
+/*
+ * The request will not use the connection get() returned after all.  Returns
+ * the number of streams still on it; the slot get() took stays with the
+ * request, for the new connection it is about to open.
+ */
+
+ngx_uint_t
+ngx_http_upstream_keepalive_mux_declined(ngx_peer_connection_t *pc,
+    void *data)
+{
+    ngx_http_upstream_keepalive_peer_data_t  *kp = data;
+    ngx_http_upstream_keepalive_cache_t      *item;
+
+    item = kp->item;
+
+    kp->item = NULL;
+    kp->mux_conn = NULL;
+    kp->surplus = 0;
+
+    if (item == NULL) {
+        return 0;
+    }
+
+    if (item->active) {
+        item->active--;
+    }
+
+    return item->active;
 }
 
 

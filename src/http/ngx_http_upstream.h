@@ -423,6 +423,10 @@ struct ngx_http_upstream_s {
     unsigned                         request_body_blocked:1;
     unsigned                         header_sent:1;
     unsigned                         response_received:1;
+
+    /* called once the balancer peer is initialised, before connecting */
+    ngx_int_t                      (*init_peer)(ngx_http_request_t *r,
+                                         ngx_http_upstream_t *u);
 };
 
 
@@ -456,6 +460,14 @@ ngx_int_t ngx_http_upstream_hide_headers_hash(ngx_conf_t *cf,
 ngx_int_t ngx_http_upstream_merge_ssl_passwords(ngx_conf_t *cf,
     ngx_http_upstream_conf_t *conf, ngx_http_upstream_conf_t *prev);
 #endif
+
+ngx_int_t ngx_http_upstream_keepalive_set_mux(ngx_connection_t *c, void *mux,
+    ngx_event_handler_pt read_handler, ngx_event_handler_pt write_handler);
+void *ngx_http_upstream_keepalive_get_mux(ngx_connection_t *c);
+void ngx_http_upstream_keepalive_mux_joined(ngx_peer_connection_t *pc,
+    void *data);
+ngx_uint_t ngx_http_upstream_keepalive_mux_declined(ngx_peer_connection_t *pc,
+    void *data);
 
 
 #define ngx_http_conf_upstream_srv_conf(uscf, module)                         \

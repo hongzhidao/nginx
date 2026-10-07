@@ -76,6 +76,8 @@ typedef struct {
     ngx_uint_t                     headers_hash_max_size;
     ngx_uint_t                     headers_hash_bucket_size;
 
+    ngx_uint_t                     http2_max_concurrent_streams;
+
 #if (NGX_HTTP_SSL || NGX_COMPAT)
     ngx_uint_t                     ssl;
     ngx_uint_t                     ssl_protocols;
