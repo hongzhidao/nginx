@@ -2614,6 +2614,11 @@ again:
 
 done:
 
+    if (rc == NGX_HTTP_UPSTREAM_CONNECTION_ERROR) {
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+        return;
+    }
+
     if (rc == NGX_HTTP_UPSTREAM_INVALID_HEADER) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_INVALID_HEADER);
         return;
