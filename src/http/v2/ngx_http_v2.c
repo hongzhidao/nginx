@@ -3132,6 +3132,7 @@ ngx_http_v2_create_stream(ngx_http_v2_connection_t *h2c)
     ngx_memcpy(fc, h2c->connection, sizeof(ngx_connection_t));
 
     fc->data = h2c->http_connection;
+    fc->shared = 1;
     fc->read = rev;
     fc->write = wev;
     fc->sent = 0;
