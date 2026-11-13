@@ -746,6 +746,7 @@ ngx_quic_create_stream(ngx_connection_t *c, uint64_t id)
 
     sc->quic = qs;
     sc->shared = 1;
+    sc->transport = 0;
     sc->type = SOCK_STREAM;
     sc->pool = pool;
     sc->ssl = c->ssl;
