@@ -1586,6 +1586,16 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     ngx_connection_t          *c;
     ngx_http_core_loc_conf_t  *clcf;
 
+    if (u->init_peer) {
+        if (u->init_peer(r, u->upstream) != NGX_OK) {
+            ngx_http_upstream_finalize_request(r, u,
+                                               NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        u->init_peer = NULL;
+    }
+
     r->connection->log->action = "connecting to upstream";
 
     if (u->state && u->state->response_time == (ngx_msec_t) -1) {
