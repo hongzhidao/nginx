@@ -1248,6 +1248,7 @@ ngx_get_connection(ngx_socket_t s, ngx_log_t *log)
     c->write = wev;
     c->fd = s;
     c->log = log;
+    c->transport = 1;
 
     instance = rev->instance;
 
