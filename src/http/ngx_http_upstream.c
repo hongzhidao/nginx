@@ -2260,7 +2260,10 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     }
 
     if (rc == NGX_AGAIN) {
-        if (!c->write->ready || u->request_body_blocked) {
+        if (u->write_timer) {
+            u->write_timer(r);
+
+        } else if (!c->write->ready || u->request_body_blocked) {
             ngx_add_timer(c->write, u->conf->send_timeout);
 
         } else if (c->write->timer_set) {
@@ -2332,7 +2335,12 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
             return;
         }
 
-        ngx_add_timer(c->read, u->conf->read_timeout);
+        if (u->read_timer) {
+            u->read_timer(r);
+
+        } else {
+            ngx_add_timer(c->read, u->conf->read_timeout);
+        }
 
         if (c->read->ready) {
             ngx_http_upstream_process_header(r, u);
