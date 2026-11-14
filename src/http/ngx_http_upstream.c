@@ -3689,12 +3689,6 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     /* TODO: p->free_bufs = 0 if use ngx_create_chain_of_bufs() */
     p->free_bufs = 1;
 
-    /*
-     * event_pipe would do u->buffer.last += p->preread_size
-     * as though these bytes were read
-     */
-    u->buffer.last = u->buffer.pos;
-
     if (u->conf->cyclic_temp_file) {
 
         /*

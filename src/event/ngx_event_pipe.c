@@ -11,7 +11,65 @@
 #include <ngx_event_pipe.h>
 
 
+typedef struct ngx_event_pipe_input_s {
+    ngx_queue_t        buffers;
+    ngx_queue_t        available;
+    ngx_queue_t        pending;
+    ngx_chain_t       *receiving;
+
+    ngx_int_t          allocated;
+    size_t             size;
+    size_t             reserved;
+    size_t             committed;
+    size_t             ready;
+} ngx_event_pipe_input_t;
+
+
+/*
+ * Storage cursors are independent of receive views and downstream shadows.
+ * Each block has one reusable receive view and one live publication.  Socket
+ * input seals partial publications until release; producers may keep receiving
+ * into the unused tail while an earlier prefix is retained downstream.
+ */
+
+typedef struct {
+    ngx_buf_t          raw;       /* must be first */
+    ngx_buf_t          view;
+    ngx_chain_t        receive;
+    ngx_queue_t        buffers;
+    ngx_queue_t        available;
+    ngx_queue_t        pending;
+
+    u_char            *start;
+    u_char            *pos;
+    u_char            *ready;
+    u_char            *last;
+    u_char            *end;
+    size_t             reserved;
+
+    unsigned           busy:1;
+    unsigned           queued:1;
+    unsigned           writable:1;
+} ngx_event_pipe_input_block_t;
+
+
+static ngx_int_t ngx_event_pipe_input_advance(ngx_event_pipe_t *p, size_t n);
+static ngx_int_t ngx_event_pipe_input_publish(ngx_event_pipe_t *p,
+    size_t n, ngx_uint_t seal);
+static ngx_int_t ngx_event_pipe_input_preread(ngx_event_pipe_t *p);
+static size_t ngx_event_pipe_input_full(ngx_event_pipe_t *p);
+static ngx_buf_t *ngx_event_pipe_input_next(ngx_event_pipe_t *p);
+static void ngx_event_pipe_input_release(ngx_event_pipe_t *p, ngx_buf_t *buf);
+static void ngx_event_pipe_input_reclaim(ngx_event_pipe_t *p);
+static void ngx_event_pipe_input_reset(ngx_event_pipe_t *p,
+    ngx_event_pipe_input_block_t *b);
+static void ngx_event_pipe_input_queue(ngx_event_pipe_t *p,
+    ngx_event_pipe_input_block_t *b);
+static ngx_uint_t ngx_event_pipe_input_blocked(ngx_event_pipe_t *p);
+
 static ngx_int_t ngx_event_pipe_read_upstream(ngx_event_pipe_t *p);
+static ngx_int_t ngx_event_pipe_read_socket(ngx_event_pipe_t *p);
+static ngx_int_t ngx_event_pipe_filter_input(ngx_event_pipe_t *p);
 static ngx_int_t ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p);
 static ngx_int_t ngx_event_pipe_output_chain(ngx_event_pipe_t *p,
     ngx_chain_t **out);
@@ -34,6 +92,14 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     ngx_int_t     rc;
     ngx_uint_t    flags;
     ngx_event_t  *rev, *wev;
+
+    if (p->input == NULL && ngx_event_pipe_input_init(p) != NGX_OK) {
+        return NGX_ABORT;
+    }
+
+    if (p->busy) {
+        do_write = 1;
+    }
 
     for ( ;; ) {
         if (do_write) {
@@ -65,6 +131,8 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 
         do_write = 1;
     }
+
+    ngx_event_pipe_input_reclaim(p);
 
     if (p->upstream
         && p->upstream->fd != (ngx_socket_t) -1)
@@ -109,15 +177,558 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 }
 
 
+ngx_int_t
+ngx_event_pipe_input_init(ngx_event_pipe_t *p)
+{
+    ngx_event_pipe_input_t  *in;
+
+    if (p->input) {
+        return NGX_BUSY;
+    }
+
+    in = ngx_pcalloc(p->pool, sizeof(ngx_event_pipe_input_t));
+    if (in == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_queue_init(&in->buffers);
+    ngx_queue_init(&in->available);
+    ngx_queue_init(&in->pending);
+    p->input = in;
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_event_pipe_input_reserve(ngx_event_pipe_t *p, ngx_uint_t n)
+{
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (p->bufs.num <= 0 || p->bufs.size == 0
+        || n > (ngx_uint_t) p->bufs.num || in->receiving
+        || p->bufs.size > NGX_MAX_SIZE_T_VALUE / (size_t) p->bufs.num)
+    {
+        return NGX_ERROR;
+    }
+
+    while ((ngx_uint_t) in->allocated < n) {
+        b = ngx_pcalloc(p->pool, sizeof(ngx_event_pipe_input_block_t));
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->start = ngx_palloc(p->pool, p->bufs.size);
+        if (b->start == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->end = b->start + p->bufs.size;
+        ngx_queue_insert_tail(&in->buffers, &b->buffers);
+        ngx_event_pipe_input_reset(p, b);
+        in->allocated++;
+        in->size += p->bufs.size;
+    }
+
+    return NGX_OK;
+}
+
+
+size_t
+ngx_event_pipe_input_capacity(ngx_event_pipe_t *p, size_t *size)
+{
+    size_t                         n;
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (size) {
+        *size = in->size;
+    }
+
+    n = 0;
+
+    for (q = ngx_queue_head(&in->available);
+         q != ngx_queue_sentinel(&in->available);
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, available);
+
+        if (b->queued && &b->pending != ngx_queue_last(&in->pending)) {
+            continue;
+        }
+
+        n += b->end - b->last - b->reserved;
+    }
+
+    return n;
+}
+
+
+ngx_chain_t *
+ngx_event_pipe_input_alloc_bufs(ngx_event_pipe_t *p, size_t limit)
+{
+    size_t                         n;
+    ngx_chain_t                  **ll;
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (in->receiving || limit == 0) {
+        return NULL;
+    }
+
+    ll = &in->receiving;
+
+    for (q = ngx_queue_head(&in->available);
+         q != ngx_queue_sentinel(&in->available) && limit;
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, available);
+
+        if (b->queued && &b->pending != ngx_queue_last(&in->pending)) {
+            continue;
+        }
+
+        n = ngx_min((size_t) (b->end - b->last), limit);
+        ngx_memzero(&b->view, sizeof(ngx_buf_t));
+        b->view.start = b->last;
+        b->view.pos = b->last;
+        b->view.last = b->last;
+        b->view.end = b->last + n;
+        b->view.temporary = 1;
+        b->receive.buf = &b->view;
+        b->receive.next = NULL;
+        b->reserved = n;
+
+        *ll = &b->receive;
+        ll = &b->receive.next;
+        in->reserved += n;
+        limit -= n;
+    }
+
+    return in->receiving;
+}
+
+
+ngx_int_t
+ngx_event_pipe_input_commit(ngx_event_pipe_t *p, size_t n)
+{
+    ngx_event_pipe_input_t  *in;
+
+    in = p->input;
+
+    if (ngx_event_pipe_input_advance(p, n) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return ngx_event_pipe_input_publish(p, in->committed - in->ready, 0);
+}
+
+
+static ngx_int_t
+ngx_event_pipe_input_advance(ngx_event_pipe_t *p, size_t n)
+{
+    size_t                         size;
+    ngx_chain_t                   *cl, *next;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (in->receiving == NULL || n > in->reserved) {
+        return NGX_ERROR;
+    }
+
+    p->read_length += n;
+    in->committed += n;
+
+    for (cl = in->receiving; cl; cl = next) {
+        next = cl->next;
+        b = (ngx_event_pipe_input_block_t *)
+                ((u_char *) cl - offsetof(ngx_event_pipe_input_block_t, receive));
+
+        size = ngx_min(n, b->reserved);
+        b->last += size;
+        b->reserved = 0;
+        n -= size;
+
+        if (size) {
+            ngx_event_pipe_input_queue(p, b);
+
+            if (b->last == b->end) {
+                ngx_queue_remove(&b->available);
+                b->writable = 0;
+            }
+        }
+
+        if (!b->busy && !b->queued) {
+            ngx_event_pipe_input_reset(p, b);
+        }
+    }
+
+    in->receiving = NULL;
+    in->reserved = 0;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_event_pipe_input_publish(ngx_event_pipe_t *p, size_t n, ngx_uint_t seal)
+{
+    size_t                         size;
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (in->receiving || n > in->committed - in->ready) {
+        return NGX_ERROR;
+    }
+
+    in->ready += n;
+
+    for (q = ngx_queue_head(&in->pending);
+         q != ngx_queue_sentinel(&in->pending) && n;
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, pending);
+        size = ngx_min(n, (size_t) (b->last - b->ready));
+        b->ready += size;
+        n -= size;
+
+        if (seal && size && b->writable) {
+            ngx_queue_remove(&b->available);
+            b->writable = 0;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static size_t
+ngx_event_pipe_input_full(ngx_event_pipe_t *p)
+{
+    size_t                         n;
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+    n = 0;
+
+    for (q = ngx_queue_head(&in->pending);
+         q != ngx_queue_sentinel(&in->pending);
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, pending);
+        if (b->last != b->end) {
+            break;
+        }
+
+        n += b->last - b->ready;
+    }
+
+    return n;
+}
+
+
+static ngx_buf_t *
+ngx_event_pipe_input_next(ngx_event_pipe_t *p)
+{
+    size_t                         n;
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (ngx_queue_empty(&in->pending)) {
+        return NULL;
+    }
+
+    q = ngx_queue_head(&in->pending);
+    b = ngx_queue_data(q, ngx_event_pipe_input_block_t, pending);
+
+    if (b->busy || b->reserved || b->pos == b->ready) {
+        return NULL;
+    }
+
+    ngx_memzero(&b->raw, sizeof(ngx_buf_t));
+    b->raw.start = b->start;
+    b->raw.pos = b->pos;
+    b->raw.last = b->ready;
+    b->raw.end = b->end;
+    b->raw.temporary = 1;
+    b->busy = 1;
+
+    n = b->ready - b->pos;
+    b->pos = b->ready;
+    in->committed -= n;
+    in->ready -= n;
+
+    if (b->pos == b->last) {
+        ngx_queue_remove(&b->pending);
+        b->queued = 0;
+    }
+
+    return &b->raw;
+}
+
+
+static void
+ngx_event_pipe_input_release(ngx_event_pipe_t *p, ngx_buf_t *buf)
+{
+    ngx_event_pipe_input_block_t  *b;
+
+    b = (ngx_event_pipe_input_block_t *) buf;
+
+    if (!b->busy) {
+        return;
+    }
+
+    b->busy = 0;
+    b->raw.shadow = NULL;
+
+    if (!b->queued && !b->reserved) {
+        ngx_event_pipe_input_reset(p, b);
+    }
+}
+
+
+static ngx_int_t
+ngx_event_pipe_input_preread(ngx_event_pipe_t *p)
+{
+    size_t                         n;
+    ngx_buf_t                     *raw;
+    ngx_chain_t                   *cl;
+    ngx_queue_t                   *available;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+    n = 0;
+    available = ngx_queue_head(&in->available);
+
+    while (p->preread_bufs) {
+        cl = p->preread_bufs;
+        raw = cl->buf;
+
+        b = ngx_pcalloc(p->pool, sizeof(ngx_event_pipe_input_block_t));
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->start = raw->start;
+        b->pos = raw->pos;
+        b->ready = raw->pos;
+        b->last = raw->last;
+        b->end = raw->end;
+        ngx_queue_insert_tail(&in->buffers, &b->buffers);
+        in->size += b->end - b->start;
+        n += b->last - b->pos;
+
+        if (b->pos != b->last) {
+            ngx_event_pipe_input_queue(p, b);
+        }
+
+        if (b->last != b->end) {
+            /* append to preread storage before using preallocated blocks */
+
+            ngx_queue_insert_tail(available, &b->available);
+            b->writable = 1;
+        }
+
+        p->preread_bufs = cl->next;
+        ngx_free_chain(p->pool, cl);
+    }
+
+    in->committed += n;
+    p->read_length += n;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_event_pipe_input_reclaim(ngx_event_pipe_t *p)
+{
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    for (q = ngx_queue_head(&in->buffers);
+         q != ngx_queue_sentinel(&in->buffers);
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, buffers);
+
+        if (b->start == NULL || b->busy || b->queued || b->reserved) {
+            continue;
+        }
+
+        if (p->free_bufs && p->buf_to_file == NULL
+            && (p->upstream_done || p->upstream_eof || p->upstream_error))
+        {
+            if (b->writable) {
+                ngx_queue_remove(&b->available);
+                b->writable = 0;
+            }
+
+            in->size -= b->end - b->start;
+            ngx_pfree(p->pool, b->start);
+            b->start = NULL;
+            continue;
+        }
+
+        ngx_event_pipe_input_reset(p, b);
+    }
+}
+
+
+static void
+ngx_event_pipe_input_reset(ngx_event_pipe_t *p,
+    ngx_event_pipe_input_block_t *b)
+{
+    ngx_buf_t  *header;
+
+    header = p->buf_to_file;
+    b->pos = (header && b->start == header->start) ? header->last : b->start;
+    b->ready = b->pos;
+    b->last = b->pos;
+
+    if (!b->writable && b->last != b->end) {
+        ngx_queue_insert_tail(&p->input->available, &b->available);
+        b->writable = 1;
+    }
+}
+
+
+static void
+ngx_event_pipe_input_queue(ngx_event_pipe_t *p,
+    ngx_event_pipe_input_block_t *b)
+{
+    if (!b->queued) {
+        ngx_queue_insert_tail(&p->input->pending, &b->pending);
+        b->queued = 1;
+    }
+}
+
+
 static ngx_int_t
 ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 {
+    ngx_int_t  rc;
+
+#if (NGX_THREADS)
+
+    if (p->writing) {
+        rc = ngx_event_pipe_write_chain_to_temp_file(p);
+        if (rc != NGX_OK) {
+            return rc;
+        }
+    }
+
+    if (p->aio && p->cacheable) {
+        return NGX_AGAIN;
+    }
+
+#endif
+
+    rc = ngx_event_pipe_read_socket(p);
+
+    if (rc == NGX_ABORT) {
+        return NGX_ABORT;
+    }
+
+    if (ngx_event_pipe_filter_input(p) != NGX_OK) {
+        return NGX_ABORT;
+    }
+
+    if (p->length == 0 && !p->upstream_done) {
+        p->upstream_done = 1;
+        p->read = 1;
+    }
+
+    if ((p->cacheable && (p->in || p->buf_to_file))
+        || (p->in && ngx_event_pipe_input_capacity(p, NULL) == 0
+            && p->temp_file->offset < p->max_temp_file_size
+            && (p->downstream_error
+                || p->downstream->data != p->output_ctx
+                || !p->downstream->write->ready
+                || p->downstream->write->delayed)))
+    {
+#if (NGX_THREADS)
+        if (p->aio) {
+            return NGX_AGAIN;
+        }
+#endif
+
+        rc = ngx_event_pipe_write_chain_to_temp_file(p);
+        if (rc != NGX_OK) {
+            return rc;
+        }
+
+        p->read = 1;
+    }
+
+    if (p->busy && ngx_event_pipe_input_blocked(p)
+        && !p->downstream_error
+        && p->downstream->data == p->output_ctx
+        && p->downstream->write->ready
+        && !p->downstream->write->delayed)
+    {
+        p->upstream_blocked = 1;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_uint_t
+ngx_event_pipe_input_blocked(ngx_event_pipe_t *p)
+{
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    if (ngx_queue_empty(&in->pending)) {
+        return 0;
+    }
+
+    q = ngx_queue_head(&in->pending);
+    b = ngx_queue_data(q, ngx_event_pipe_input_block_t, pending);
+
+    return b->busy && b->pos != b->ready;
+}
+
+
+static ngx_int_t
+ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
+{
     off_t         limit;
-    ssize_t       n, size;
+    size_t        capacity;
+    ssize_t       n;
     ngx_int_t     rc;
-    ngx_buf_t    *b;
     ngx_msec_t    delay;
-    ngx_chain_t  *chain, *cl, *ln;
+    ngx_chain_t  *chain;
+#if (NGX_DEBUG)
+    ngx_chain_t  *cl;
+#endif
 
     if (p->upstream_eof || p->upstream_error || p->upstream_done
         || p->upstream == NULL)
@@ -131,17 +742,6 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, p->log, 0,
                        "pipe read upstream: aio");
         return NGX_AGAIN;
-    }
-
-    if (p->writing) {
-        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, p->log, 0,
-                       "pipe read upstream: writing");
-
-        rc = ngx_event_pipe_write_chain_to_temp_file(p);
-
-        if (rc != NGX_OK) {
-            return rc;
-        }
     }
 
 #endif
@@ -163,9 +763,11 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 
             /* use the pre-read bufs if they exist */
 
-            chain = p->preread_bufs;
-            p->preread_bufs = NULL;
             n = p->preread_size;
+
+            if (ngx_event_pipe_input_preread(p) != NGX_OK) {
+                return NGX_ABORT;
+            }
 
             ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                            "pipe preread: %z", n);
@@ -230,37 +832,26 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
                 limit = 0;
             }
 
-            if (p->free_raw_bufs) {
+            capacity = ngx_event_pipe_input_capacity(p, NULL);
 
-                /* use the free bufs if they exist */
-
-                chain = p->free_raw_bufs;
-                p->free_raw_bufs = NULL;
-
-            } else if (p->allocated < p->bufs.num) {
+            if (capacity == 0 && p->input->allocated < p->bufs.num) {
 
                 /* allocate a new buf if it's still allowed */
 
-                b = ngx_create_temp_buf(p->pool, p->bufs.size);
-                if (b == NULL) {
+                if (ngx_event_pipe_input_reserve(p, p->input->allocated + 1)
+                    != NGX_OK)
+                {
                     return NGX_ABORT;
                 }
 
-                p->allocated++;
+                capacity = ngx_event_pipe_input_capacity(p, NULL);
+            }
 
-                chain = ngx_alloc_chain_link(p->pool);
-                if (chain == NULL) {
-                    return NGX_ABORT;
-                }
-
-                chain->buf = b;
-                chain->next = NULL;
-
-            } else if (!p->cacheable
-                       && !p->downstream_error
-                       && p->downstream->data == p->output_ctx
-                       && p->downstream->write->ready
-                       && !p->downstream->write->delayed)
+            if (capacity == 0 && !p->cacheable
+                && !p->downstream_error
+                && p->downstream->data == p->output_ctx
+                && p->downstream->write->ready
+                && !p->downstream->write->delayed)
             {
                 /*
                  * if the bufs are not needed to be saved in a cache and
@@ -274,8 +865,9 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 
                 break;
 
-            } else if (p->cacheable
-                       || p->temp_file->offset < p->max_temp_file_size)
+            } else if (capacity == 0
+                       && (p->cacheable
+                           || p->temp_file->offset < p->max_temp_file_size))
             {
 
                 /*
@@ -296,10 +888,10 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
                     return rc;
                 }
 
-                chain = p->free_raw_bufs;
-                p->free_raw_bufs = NULL;
+                capacity = ngx_event_pipe_input_capacity(p, NULL);
+            }
 
-            } else {
+            if (capacity == 0) {
 
                 /* there are no bufs to read in */
 
@@ -309,15 +901,23 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
                 break;
             }
 
+            if (limit && (off_t) capacity > limit) {
+                capacity = (size_t) limit;
+            }
+
+            chain = ngx_event_pipe_input_alloc_bufs(p, capacity);
+            if (chain == NULL) {
+                return NGX_ABORT;
+            }
+
             n = p->upstream->recv_chain(p->upstream, chain, limit);
 
             ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                            "pipe recv chain: %z", n);
 
-            if (p->free_raw_bufs) {
-                chain->next = p->free_raw_bufs;
+            if (ngx_event_pipe_input_advance(p, n > 0 ? n : 0) != NGX_OK) {
+                return NGX_ABORT;
             }
-            p->free_raw_bufs = chain;
 
             if (n == NGX_ERROR) {
                 p->upstream_error = 1;
@@ -336,44 +936,17 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
             }
         }
 
+        if (ngx_event_pipe_input_publish(p, ngx_event_pipe_input_full(p), 1)
+            != NGX_OK)
+        {
+            return NGX_ABORT;
+        }
+
+        if (ngx_event_pipe_filter_input(p) != NGX_OK) {
+            return NGX_ABORT;
+        }
+
         delay = p->limit_rate ? (ngx_msec_t) n * 1000 / p->limit_rate : 0;
-
-        p->read_length += n;
-        cl = chain;
-        p->free_raw_bufs = NULL;
-
-        while (cl && n > 0) {
-
-            ngx_event_pipe_remove_shadow_links(cl->buf);
-
-            size = cl->buf->end - cl->buf->last;
-
-            if (n >= size) {
-                cl->buf->last = cl->buf->end;
-
-                /* STUB */ cl->buf->num = p->num++;
-
-                if (p->input_filter(p, cl->buf) == NGX_ERROR) {
-                    return NGX_ABORT;
-                }
-
-                n -= size;
-                ln = cl;
-                cl = cl->next;
-                ngx_free_chain(p->pool, ln);
-
-            } else {
-                cl->buf->last += n;
-                n = 0;
-            }
-        }
-
-        if (cl) {
-            for (ln = cl; ln->next; ln = ln->next) { /* void */ }
-
-            ln->next = p->free_raw_bufs;
-            p->free_raw_bufs = cl;
-        }
 
         if (delay > 0) {
             p->upstream->read->delayed = 1;
@@ -423,78 +996,50 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
                        cl->buf->file_last - cl->buf->file_pos);
     }
 
-    for (cl = p->free_raw_bufs; cl; cl = cl->next) {
-        ngx_log_debug8(NGX_LOG_DEBUG_EVENT, p->log, 0,
-                       "pipe buf free s:%d t:%d f:%d "
-                       "%p, pos %p, size: %z "
-                       "file: %O, size: %O",
-                       (cl->buf->shadow ? 1 : 0),
-                       cl->buf->temporary, cl->buf->in_file,
-                       cl->buf->start, cl->buf->pos,
-                       cl->buf->last - cl->buf->pos,
-                       cl->buf->file_pos,
-                       cl->buf->file_last - cl->buf->file_pos);
-    }
-
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                    "pipe length: %O", p->length);
 
 #endif
 
-    if (p->free_raw_bufs && p->length != -1) {
-        cl = p->free_raw_bufs;
-
-        if (cl->buf->last - cl->buf->pos >= p->length) {
-
-            p->free_raw_bufs = cl->next;
-
-            /* STUB */ cl->buf->num = p->num++;
-
-            if (p->input_filter(p, cl->buf) == NGX_ERROR) {
-                return NGX_ABORT;
-            }
-
-            ngx_free_chain(p->pool, cl);
-        }
-    }
-
-    if (p->length == 0) {
-        p->upstream_done = 1;
-        p->read = 1;
-    }
-
-    if ((p->upstream_eof || p->upstream_error) && p->free_raw_bufs) {
-
-        cl = p->free_raw_bufs;
-        p->free_raw_bufs = cl->next;
-
-        /* STUB */ cl->buf->num = p->num++;
-
-        if (p->input_filter(p, cl->buf) == NGX_ERROR) {
+    if (p->input->committed
+        && (p->upstream_eof || p->upstream_error
+            || (p->length != -1
+                && (off_t) p->input->committed >= p->length)))
+    {
+        if (ngx_event_pipe_input_publish(p,
+                                         p->input->committed - p->input->ready,
+                                         1)
+            != NGX_OK)
+        {
             return NGX_ABORT;
         }
 
-        ngx_free_chain(p->pool, cl);
-
-        if (p->free_bufs && p->buf_to_file == NULL) {
-            for (cl = p->free_raw_bufs; cl; cl = cl->next) {
-                if (cl->buf->shadow == NULL) {
-                    ngx_pfree(p->pool, cl->buf->start);
-                }
-            }
+        if (ngx_event_pipe_filter_input(p) != NGX_OK) {
+            return NGX_ABORT;
         }
     }
 
-    if (p->cacheable && (p->in || p->buf_to_file)) {
+    return NGX_OK;
+}
 
-        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, p->log, 0,
-                       "pipe write chain");
 
-        rc = ngx_event_pipe_write_chain_to_temp_file(p);
+static ngx_int_t
+ngx_event_pipe_filter_input(ngx_event_pipe_t *p)
+{
+    ngx_buf_t  *buf;
 
-        if (rc != NGX_OK) {
-            return rc;
+    while ((buf = ngx_event_pipe_input_next(p)) != NULL) {
+        /* STUB */ buf->num = p->num++;
+
+        if (p->input_filter(p, buf) == NGX_ERROR) {
+            return NGX_ABORT;
         }
+
+        if (buf->shadow == NULL) {
+            ngx_event_pipe_input_release(p, buf);
+        }
+
+        p->read = 1;
     }
 
     return NGX_OK;
@@ -515,6 +1060,13 @@ ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p)
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                    "pipe write downstream: %d", downstream->write->ready);
+
+    out = NULL;
+    ngx_chain_update_chains(p->pool, &p->free, &p->busy, &out, p->tag);
+
+    if (ngx_event_pipe_recycle_buffers(p) != NGX_OK) {
+        return NGX_ABORT;
+    }
 
 #if (NGX_THREADS)
 
@@ -641,7 +1193,7 @@ ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p)
             goto flush;
         }
 
-        flush = 0;
+        flush = p->busy && ngx_event_pipe_input_blocked(p);
         ll = NULL;
         prev_last_shadow = 1;
 
@@ -751,7 +1303,7 @@ ngx_event_pipe_recycle_buffers(ngx_event_pipe_t *p)
 
         /* TODO: free buf if p->free_bufs && upstream done */
 
-        /* add the free shadow raw buf to p->free_raw_bufs */
+        /* return the storage behind the last consumed shadow */
 
         if (cl->buf->last_shadow) {
             if (ngx_event_pipe_add_free_buf(p, cl->buf->shadow) != NGX_OK) {
@@ -1117,47 +1669,7 @@ ngx_event_pipe_remove_shadow_links(ngx_buf_t *buf)
 ngx_int_t
 ngx_event_pipe_add_free_buf(ngx_event_pipe_t *p, ngx_buf_t *b)
 {
-    ngx_chain_t  *cl;
-
-    cl = ngx_alloc_chain_link(p->pool);
-    if (cl == NULL) {
-        return NGX_ERROR;
-    }
-
-    if (p->buf_to_file && b->start == p->buf_to_file->start) {
-        b->pos = p->buf_to_file->last;
-        b->last = p->buf_to_file->last;
-
-    } else {
-        b->pos = b->start;
-        b->last = b->start;
-    }
-
-    b->shadow = NULL;
-
-    cl->buf = b;
-
-    if (p->free_raw_bufs == NULL) {
-        p->free_raw_bufs = cl;
-        cl->next = NULL;
-
-        return NGX_OK;
-    }
-
-    if (p->free_raw_bufs->buf->pos == p->free_raw_bufs->buf->last) {
-
-        /* add the free buf to the list start */
-
-        cl->next = p->free_raw_bufs;
-        p->free_raw_bufs = cl;
-
-        return NGX_OK;
-    }
-
-    /* the first free buf is partially filled, thus add the free buf after it */
-
-    cl->next = p->free_raw_bufs->next;
-    p->free_raw_bufs->next = cl;
+    ngx_event_pipe_input_release(p, b);
 
     return NGX_OK;
 }
