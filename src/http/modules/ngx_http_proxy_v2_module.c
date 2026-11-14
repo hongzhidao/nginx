@@ -2535,6 +2535,7 @@ ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
     stream->connection.error = 1;
     stream->read.error = 1;
     stream->read.ready = 1;
+    stream->read.delayed = 0;
     stream->read_waiting = 0;
 
     error = stream->failure == NGX_HTTP_UPSTREAM_FT_TIMEOUT
@@ -2547,6 +2548,7 @@ ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
     /* Protocol cancellation can precede input completion on an ended stream. */
 
     u = stream->request->upstream;
+    u->keepalive = 0;
     u->length = 1;
     u->pipe->length = 1;
     stream->done = 0;
@@ -7469,7 +7471,6 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
     ngx_int_t                    rc;
     ngx_connection_t            *c;
     ngx_http_request_t          *r;
-    ngx_http_upstream_t         *u;
     ngx_http_proxy_v2_stream_t  *stream;
 
     c = ev->data;
@@ -7503,7 +7504,6 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
     }
 
     r = stream->request;
-    u = r->upstream;
 
     if (stream->body_started) {
         rc = ngx_http_proxy_v2_read_response(stream);
@@ -7517,36 +7517,21 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
         }
     }
 
-    if (c->error) {
-
-        /* Failure must reach a pipe which has no receive buffer available. */
-
-        ev = c->read;
-        ev->error = 1;
-        ev->ready = 1;
-        ev->delayed = 0;
-
-        if (ev->timer_set) {
-            ngx_del_timer(ev);
-        }
-    }
-
 done:
 
     if (stream->failure) {
         rc = ngx_http_proxy_v2_fail_stream(stream, stream->failure, stream->error);
         if (rc != NGX_OK) {
             r = stream->request;
-            u = r->upstream;
             c = r->connection;
             ngx_log_error(NGX_LOG_ALERT, c->log, 0,
                           "could not finish http2 response input: %i", rc);
 
             /* Quiesce the endpoint before post_action can redirect. */
 
-            if (u->cleanup) {
+            if (r->upstream->cleanup) {
                 r->main->count++;
-                (*u->cleanup)(r);
+                (*r->upstream->cleanup)(r);
             }
 
             ngx_http_finalize_request(r, NGX_ERROR);
