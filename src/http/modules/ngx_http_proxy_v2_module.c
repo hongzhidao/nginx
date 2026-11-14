@@ -2239,19 +2239,12 @@ ngx_http_proxy_v2_filter_init(void *data)
         stream->length = u->headers_in.content_length_n;
     }
 
-    if (stream->input_closed) {
-
-        if (ngx_http_proxy_v2_finish_response(r, stream) != NGX_OK) {
-            return NGX_ERROR;
-        }
-
-        u->length = stream->done ? 0 : 1;
-        u->pipe->length = u->length;
-
-    } else {
-        u->length = 1;
-        u->pipe->length = 1;
+    if (ngx_http_proxy_v2_finish_response(r, stream) != NGX_OK) {
+        return NGX_ERROR;
     }
+
+    u->length = stream->done ? 0 : 1;
+    u->pipe->length = u->length;
 
     return NGX_OK;
 }
