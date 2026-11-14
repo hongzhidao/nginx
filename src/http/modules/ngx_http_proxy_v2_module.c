@@ -25,9 +25,9 @@
 #define NGX_HTTP_PROXY_V2_MAX_REPLIES    64
 #define NGX_HTTP_PROXY_V2_MAX_STREAMS    128
 #define NGX_HTTP_PROXY_V2_SEND_LIMIT     65536
-#define NGX_HTTP_PROXY_V2_READ_LIMIT     65536
-#define NGX_HTTP_PROXY_V2_READ_BUFFER    16384
-#define NGX_HTTP_PROXY_V2_READ_PREREAD   1024
+#define NGX_HTTP_PROXY_V2_READ_LIMIT     262144
+#define NGX_HTTP_PROXY_V2_READ_BUFFER    65536
+#define NGX_HTTP_PROXY_V2_READ_DIRECT    16384
 #define NGX_HTTP_PROXY_V2_READ_BUFS      16
 #define NGX_HTTP_PROXY_V2_FRAME_LIMIT    32
 #define NGX_HTTP_PROXY_V2_CONTROL_BURST  8
@@ -7450,15 +7450,17 @@ ngx_http_proxy_v2_post_read(ngx_http_proxy_v2_session_t *sess)
 static ngx_int_t
 ngx_http_proxy_v2_check_input_budget(ngx_http_proxy_v2_session_t *sess)
 {
-    if (sess->input_yield || sess->parse_count == 64
-        || sess->input_bytes == NGX_HTTP_PROXY_V2_READ_LIMIT)
-    {
+    if (sess->input_yield || sess->parse_count == 64) {
         sess->input_yield = 1;
         ngx_http_proxy_v2_post_read(sess);
         return NGX_AGAIN;
     }
 
-    /* Charge parser steps and owner redispatches, including no-progress work. */
+    /*
+     * Charge parser steps and owner redispatches, including no-progress work.
+     * The transport byte limit stops refills, not parsing and publication of
+     * the batch just received.  Otherwise a full read costs an extra turn.
+     */
 
     sess->parse_count++;
     return NGX_OK;
@@ -7832,38 +7834,24 @@ ngx_http_proxy_v2_read_input(ngx_http_proxy_v2_session_t *sess)
         return rc;
     }
 
-    if (sess->state < ngx_http_proxy_v2_st_payload) {
-        /* Read ahead at frame headers; the allocation is not the read size. */
+    if (sess->state == ngx_http_proxy_v2_st_payload
+        && sess->type == NGX_HTTP_V2_DATA_FRAME && sess->frame_state
+        && !(sess->flags & NGX_HTTP_V2_PADDED_FLAG)
+        && sess->rest - sess->padding >= NGX_HTTP_PROXY_V2_READ_DIRECT)
+    {
+        stream = ngx_http_proxy_v2_find_stream(sess, sess->stream_id);
 
-        size = NGX_HTTP_PROXY_V2_READ_PREREAD;
-
-    } else {
-        size = sess->rest;
-
-        if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
-            if (sess->flags & NGX_HTTP_V2_PADDED_FLAG) {
-                size = 1;
-
-            } else if (sess->state == ngx_http_proxy_v2_st_payload
-                       && sess->frame_state && sess->rest > sess->padding)
-            {
-                stream = ngx_http_proxy_v2_find_stream(sess, sess->stream_id);
-
-                if (stream && stream->body_started && !stream->input_closed
-                    && !stream->exited && !stream->failure)
-                {
-                    return ngx_http_proxy_v2_read_data(stream);
-                }
-            }
+        if (stream && stream->body_started && !stream->input_closed
+            && !stream->exited && !stream->failure)
+        {
+            return ngx_http_proxy_v2_read_data(stream);
         }
     }
 
-    if (size == 0) {
-        return NGX_ERROR;
-    }
+    /* Refill across frame boundaries instead of issuing small tail reads. */
 
     b->pos = b->last = b->start;
-    size = ngx_min(size, (size_t) (b->end - b->last));
+    size = b->end - b->last;
     size = ngx_min(size, NGX_HTTP_PROXY_V2_READ_LIMIT - sess->input_bytes);
 
     n = sess->connection->recv(sess->connection, b->last, size);
@@ -7907,8 +7895,7 @@ ngx_http_proxy_v2_read_data(ngx_http_proxy_v2_stream_t *stream)
     }
 
     b->pos = b->last = b->start;
-    preread = ngx_min(NGX_HTTP_PROXY_V2_READ_PREREAD, limit - size);
-    preread = ngx_min(preread, (size_t) (b->end - b->start));
+    preread = ngx_min(limit - size, (size_t) (b->end - b->start));
 
     tail = chain->buf->end - chain->buf->last;
 
