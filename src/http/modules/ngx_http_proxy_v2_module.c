@@ -2761,13 +2761,6 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_proxy_v2_session_t *sess,
             {
                 stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
                 (void) ngx_http_proxy_v2_record_goaway(stream);
-            }
-
-            for (node = ngx_rbtree_min(tree->root, tree->sentinel);
-                 node;
-                 node = ngx_rbtree_next(tree, node))
-            {
-                stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
 
                 if (stream->failure) {
                     ngx_http_proxy_v2_fail_stream(stream, stream->failure,
