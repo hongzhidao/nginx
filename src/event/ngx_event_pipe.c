@@ -693,18 +693,6 @@ ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p)
 
         for (cl = p->free; cl; cl = cl->next) {
 
-            if (cl->buf->temp_file) {
-                if (p->cacheable || !p->cyclic_temp_file) {
-                    continue;
-                }
-
-                /* reset p->temp_offset if all bufs had been sent */
-
-                if (cl->buf->file_last == p->temp_file->offset) {
-                    p->temp_file->offset = 0;
-                }
-            }
-
             /* TODO: free buf if p->free_bufs && upstream done */
 
             /* add the free shadow raw buf to p->free_raw_bufs */
@@ -718,6 +706,38 @@ ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p)
             }
 
             cl->buf->shadow = NULL;
+        }
+
+        if (p->cacheable || !p->cyclic_temp_file || p->writing) {
+            continue;
+        }
+
+        /* rewind only when no live buffers reference the temporary file */
+
+        for (cl = p->out; cl; cl = cl->next) {
+            if (cl->buf->in_file
+                && cl->buf->file == &p->temp_file->file
+                && cl->buf->file_pos < cl->buf->file_last)
+            {
+                break;
+            }
+        }
+
+        if (cl) {
+            continue;
+        }
+
+        for (cl = p->busy; cl; cl = cl->next) {
+            if (cl->buf->in_file
+                && cl->buf->file == &p->temp_file->file
+                && cl->buf->file_pos < cl->buf->file_last)
+            {
+                break;
+            }
+        }
+
+        if (cl == NULL) {
+            p->temp_file->offset = 0;
         }
     }
 
