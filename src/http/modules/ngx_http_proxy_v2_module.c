@@ -26,6 +26,7 @@
 #define NGX_HTTP_PROXY_V2_MAX_STREAMS    128
 #define NGX_HTTP_PROXY_V2_SEND_LIMIT     65536
 #define NGX_HTTP_PROXY_V2_READ_LIMIT     65536
+#define NGX_HTTP_PROXY_V2_READ_BUFS      16
 #define NGX_HTTP_PROXY_V2_FRAME_LIMIT    32
 #define NGX_HTTP_PROXY_V2_CONTROL_BURST  8
 
@@ -394,7 +395,9 @@ static void ngx_http_proxy_v2_set_write_handler(
 static ssize_t ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf,
     size_t size);
 static ssize_t ngx_http_proxy_v2_read_payload(
-    ngx_http_proxy_v2_stream_t *stream, u_char *buf, size_t size);
+    ngx_http_proxy_v2_stream_t *stream, size_t size);
+static ssize_t ngx_http_proxy_v2_recv_chain(
+    ngx_http_proxy_v2_stream_t *stream, ngx_chain_t *chain, size_t size);
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
@@ -8186,7 +8189,6 @@ ngx_http_proxy_v2_read_response(ngx_http_proxy_v2_stream_t *stream)
     size_t                        size;
     ssize_t                       n;
     ngx_int_t                     rc;
-    ngx_chain_t                  *chain;
     ngx_http_request_t           *r;
     ngx_http_proxy_v2_session_t  *sess;
 
@@ -8208,9 +8210,8 @@ ngx_http_proxy_v2_read_response(ngx_http_proxy_v2_stream_t *stream)
             break;
         }
 
-        size = ngx_event_pipe_input_capacity(r->upstream->pipe, NULL);
-        size = ngx_min(size, sess->rest - sess->padding);
-        size = ngx_min(size, NGX_HTTP_PROXY_V2_READ_LIMIT - sess->input_bytes);
+        size = ngx_min(sess->rest - sess->padding,
+                      NGX_HTTP_PROXY_V2_READ_LIMIT - sess->input_bytes);
 
         if (size == 0) {
             ngx_log_error(NGX_LOG_ALERT, &sess->log, 0,
@@ -8218,13 +8219,7 @@ ngx_http_proxy_v2_read_response(ngx_http_proxy_v2_stream_t *stream)
             return NGX_ERROR;
         }
 
-        chain = ngx_event_pipe_input_alloc_bufs(r->upstream->pipe, size);
-        if (chain == NULL) {
-            return NGX_ERROR;
-        }
-
-        size = chain->buf->end - chain->buf->last;
-        n = ngx_http_proxy_v2_read_payload(stream, chain->buf->last, size);
+        n = ngx_http_proxy_v2_read_payload(stream, size);
         if (n < 0) {
             rc = n;
             break;
@@ -8285,20 +8280,33 @@ ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf, size_t size)
 
 
 static ssize_t
-ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, u_char *buf,
-    size_t size)
+ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, size_t size)
 {
+    size_t                        tail;
     ssize_t                       n;
     ngx_int_t                     rc;
+    ngx_chain_t                  *chain;
     ngx_http_request_t           *r;
     ngx_http_proxy_v2_session_t  *sess;
 
     sess = stream->session;
     r = stream->request;
 
-    /* The caller borrowed a bounded tail; commit before any fallible work. */
+    chain = ngx_event_pipe_input_alloc_bufs(r->upstream->pipe, size);
+    if (chain == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, &sess->log, 0,
+                      "no storage for admitted http2 data");
+        return NGX_ERROR;
+    }
 
-    n = sess->connection->recv(sess->connection, buf, size);
+    tail = chain->buf->end - chain->buf->last;
+
+    if (size <= tail) {
+        n = sess->connection->recv(sess->connection, chain->buf->last, size);
+
+    } else {
+        n = ngx_http_proxy_v2_recv_chain(stream, chain, size);
+    }
 
     if (ngx_event_pipe_input_commit(r->upstream->pipe, n > 0 ? n : 0)
         != NGX_OK)
@@ -8342,6 +8350,37 @@ ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, u_char *buf,
     }
 
     return n;
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv_chain(ngx_http_proxy_v2_stream_t *stream,
+    ngx_chain_t *chain, size_t size)
+{
+    ssize_t            received;
+    ngx_uint_t         n;
+    ngx_chain_t       *cl, *next;
+    ngx_connection_t  *c;
+
+    /* Views cover only this DATA's body, in reserved writable order. */
+
+    for (n = 1, cl = chain; cl->next; cl = cl->next) {
+        if (n++ == NGX_HTTP_PROXY_V2_READ_BUFS) {
+            break;
+        }
+    }
+
+    c = stream->session->connection;
+
+    next = cl->next;
+    cl->next = NULL;
+    received = c->recv_chain(c, chain, size);
+
+    /* Return every borrowed receive view when the caller commits the read. */
+
+    cl->next = next;
+
+    return received;
 }
 
 
