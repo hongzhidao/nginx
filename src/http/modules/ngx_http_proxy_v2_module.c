@@ -6422,7 +6422,6 @@ ngx_http_proxy_v2_send_expired(ngx_http_proxy_v2_stream_t *stream)
         && (ngx_msec_int_t) (stream->send_deadline - ngx_current_msec) <= 0)
     {
         ngx_http_proxy_v2_set_failure(stream, NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0, 0);
-        stream->send_expired = 1;
     }
 
     if (stream->send_expired) {
@@ -6979,7 +6978,6 @@ ngx_http_proxy_v2_read_expired(ngx_http_proxy_v2_stream_t *stream)
             && (ngx_msec_int_t) (stream->read_deadline - ngx_current_msec) <= 0))
     {
         ngx_http_proxy_v2_set_failure(stream, NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0, 0);
-        stream->read_expired = 1;
         stream->read.timedout = 1;
         ngx_post_event(&stream->read, &ngx_posted_events);
         return 1;
