@@ -6778,15 +6778,14 @@ ngx_http_proxy_v2_read_timer(ngx_http_request_t *r)
 
     sess = stream->session;
 
-    /* Local zero-credit waits cannot suspend framing or END_STREAM waits. */
+    /* Only this stream's framing or END_STREAM overrides its local wait. */
 
     blocked = stream->body_started && stream->recv_window == 0
               && (stream->recv_queued
                   || ngx_event_pipe2_input_capacity(r->upstream->pipe, NULL) == 0)
-              && sess->state == ngx_http_proxy_v2_st_start
-              && (sess->buffer == NULL
-                  || sess->buffer->pos == sess->buffer->last)
-              && !sess->header_stream_id
+              && !(sess->state >= ngx_http_proxy_v2_st_payload
+                   && sess->stream_id == stream->id)
+              && sess->header_stream_id != stream->id
               && stream->length != 0;
 
     if (blocked) {
@@ -7027,7 +7026,7 @@ ngx_http_proxy_v2_read_handler(ngx_event_t *ev)
         ngx_post_event(&stream->read, &ngx_posted_events);
     }
 
-    /* Partial framing can resume a paused wait before its owner is known. */
+    /* Recheck local waits against the current frame and header-block owner. */
 
     if (rc != NGX_ERROR && sess->nstreams) {
         for (node = ngx_rbtree_min(sess->streams.root, sess->streams.sentinel);
