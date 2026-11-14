@@ -2654,8 +2654,6 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_proxy_v2_session_t *sess,
         tree = &sess->streams;
 
         if (tree->root != tree->sentinel) {
-            /* Record all rejections before cleanup can close the session. */
-
             for (node = ngx_rbtree_min(tree->root, tree->sentinel);
                  node;
                  node = ngx_rbtree_next(tree, node))
@@ -2673,10 +2671,6 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_proxy_v2_session_t *sess,
                 if (stream->failure) {
                     ngx_http_proxy_v2_fail_stream(stream, stream->failure,
                                                   stream->error);
-
-                    if (sess->closing) {
-                        return NGX_ERROR;
-                    }
                 }
 
                 stream->read.ready = 1;
@@ -5825,10 +5819,6 @@ ngx_http_proxy_v2_send(ngx_http_proxy_v2_session_t *sess)
                             NGX_HTTP_PROXY_V2_INTERNAL_ERROR);
                     }
 
-                    if (sess->closing || sess->connection == NULL) {
-                        return NGX_ERROR;
-                    }
-
                     continue;
                 }
 
@@ -7681,12 +7671,6 @@ ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, u_char *buf,
             }
 
             ngx_http_proxy_v2_release_input(sess);
-        }
-
-        /* Cancelling the upload can close the transport after END_STREAM. */
-
-        if (sess->closing) {
-            return n;
         }
 
         /* Publish positive reads even when subsequent event rearming fails. */
