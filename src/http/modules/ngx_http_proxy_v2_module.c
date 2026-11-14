@@ -5250,8 +5250,8 @@ ngx_http_proxy_v2_send_rst_stream(ngx_http_proxy_v2_stream_t *stream,
     u_char                       *p;
     ngx_uint_t                    id;
     ngx_msec_t                    deadline;
-    ngx_http_proxy_v2_frame_t     *f;
-    ngx_http_proxy_v2_control_t   *control;
+    ngx_http_proxy_v2_frame_t    *f;
+    ngx_http_proxy_v2_control_t  *control;
     ngx_http_proxy_v2_session_t  *sess;
 
     sess = stream->session;
@@ -5366,8 +5366,8 @@ ngx_http_proxy_v2_queue_window_update(ngx_http_proxy_v2_session_t *sess,
     size_t                        n, window, *queued;
     ngx_uint_t                    id;
     ngx_chain_t                  *cl;
-    ngx_http_proxy_v2_frame_t     *f;
-    ngx_http_proxy_v2_control_t   *control;
+    ngx_http_proxy_v2_frame_t    *f;
+    ngx_http_proxy_v2_control_t  *control;
 
     id = stream ? stream->id : 0;
     window = stream ? stream->recv_window : sess->recv_window;
@@ -5593,7 +5593,7 @@ static void
 ngx_http_proxy_v2_free_control(ngx_http_proxy_v2_session_t *sess,
     ngx_http_proxy_v2_control_t *control, ngx_uint_t sent)
 {
-    size_t                      *window, *queued;
+    size_t                       *window, *queued;
     ngx_http_proxy_v2_stream_t   *stream;
 
     stream = NULL;
@@ -5665,8 +5665,8 @@ ngx_http_proxy_v2_cancel_window_updates(ngx_http_proxy_v2_session_t *sess,
     ngx_uint_t id)
 {
     ngx_chain_t                  *cl, **ll;
-    ngx_http_proxy_v2_output_t    *out;
-    ngx_http_proxy_v2_control_t   *control;
+    ngx_http_proxy_v2_output_t   *out;
+    ngx_http_proxy_v2_control_t  *control;
 
     out = &sess->output;
     if (out->control && !out->started) {
@@ -6760,7 +6760,7 @@ ngx_http_proxy_v2_update_control_timer(ngx_http_proxy_v2_session_t *sess)
     ngx_msec_t                    deadline;
     ngx_msec_int_t                timeout;
     ngx_queue_t                  *q;
-    ngx_http_proxy_v2_control_t   *control;
+    ngx_http_proxy_v2_control_t  *control;
 
     if (!sess->pending_controls || sess->closing) {
         if (sess->control_timer.timer_set) {
@@ -7874,12 +7874,9 @@ ngx_http_proxy_v2_prepare_stream(ngx_http_request_t *r,
 
     ngx_memzero(init, sizeof(ngx_http_proxy_v2_stream_init_t));
 
-    /* Keep admission serial until concurrent pool checkout is available. */
-
-    if (session->nstreams
-        || (reuse ? ngx_http_proxy_v2_reusable_session(session, 0)
-                  : ngx_http_proxy_v2_stream_capacity(session, 0))
-           != NGX_OK)
+    if ((reuse ? ngx_http_proxy_v2_reusable_session(session, 0)
+               : ngx_http_proxy_v2_stream_capacity(session, 0))
+        != NGX_OK)
     {
         return NGX_BUSY;
     }
@@ -7938,11 +7935,9 @@ ngx_http_proxy_v2_commit_stream(ngx_http_proxy_v2_peer_t *peer,
         return NGX_ERROR;
     }
 
-    if (session->nstreams
-        || (init->reuse
-            ? ngx_http_proxy_v2_reusable_session(session, 1)
-            : ngx_http_proxy_v2_stream_capacity(session, 1))
-           != NGX_OK)
+    if ((init->reuse ? ngx_http_proxy_v2_reusable_session(session, 1)
+                     : ngx_http_proxy_v2_stream_capacity(session, 1))
+        != NGX_OK)
     {
         return NGX_BUSY;
     }
@@ -8296,9 +8291,15 @@ ngx_http_proxy_v2_reusable_session(ngx_http_proxy_v2_session_t *session,
         return NGX_DECLINED;
     }
 
+    /* Active checkout does not require a quiescent transport. */
+
+    if (session->nstreams) {
+        return NGX_OK;
+    }
+
     c = session->connection;
 
-    if (!session->preface_sent || session->nstreams) {
+    if (!session->preface_sent) {
         return NGX_DECLINED;
     }
 
@@ -8357,7 +8358,7 @@ ngx_http_proxy_v2_stream_capacity(ngx_http_proxy_v2_session_t *session,
 static ngx_int_t
 ngx_http_proxy_v2_check_session(ngx_http_proxy_v2_session_t *session)
 {
-    ngx_connection_t                   *c;
+    ngx_connection_t                          *c;
     const ngx_http_upstream_keepalive_conf_t  *kcf;
 
     if (session->closing || session->connection == NULL
@@ -9055,9 +9056,9 @@ ngx_http_proxy_v2_evict(ngx_connection_t *c)
 static void
 ngx_http_proxy_v2_idle_session(ngx_http_proxy_v2_session_t *session)
 {
-    ngx_msec_t                          timeout;
-    ngx_connection_t                   *c;
-    ngx_http_proxy_v2_srv_conf_t       *conf;
+    ngx_msec_t                                timeout;
+    ngx_connection_t                         *c;
+    ngx_http_proxy_v2_srv_conf_t             *conf;
     const ngx_http_upstream_keepalive_conf_t  *kcf;
 
     if (session->nstreams || session->idle || session->closing
