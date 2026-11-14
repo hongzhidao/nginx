@@ -4484,6 +4484,13 @@ ngx_http_upstream_process_upstream(ngx_http_request_t *r,
         p->upstream_error = 1;
         ngx_connection_error(c, NGX_ETIMEDOUT, "upstream timed out");
 
+        /* Preserve the ordering of received data and the timeout error. */
+
+        if (ngx_event_pipe(p, 0) == NGX_ABORT) {
+            ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
+            return;
+        }
+
     } else {
 
         if (rev->delayed) {
@@ -4967,6 +4974,15 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     u->finalize_request(r, rc);
 
     ngx_http_upstream_free_peer(u, 0);
+
+    /*
+     * Protocol finalization and peer release stop the input producer.
+     * Cancel after it returns receive views and invalidates notifications.
+     */
+
+    if (u->pipe && u->pipe->input) {
+        ngx_event_pipe_input_cancel(u->pipe);
+    }
 
     if (u->peer.connection) {
 

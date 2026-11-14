@@ -12,16 +12,32 @@
 
 
 typedef struct ngx_event_pipe_input_s {
-    ngx_queue_t        buffers;
-    ngx_queue_t        available;
-    ngx_queue_t        pending;
-    ngx_chain_t       *receiving;
+    ngx_event_pipe_input_notify_pt  notify;
+    void                           *data;
 
-    ngx_int_t          allocated;
-    size_t             size;
-    size_t             reserved;
-    size_t             committed;
-    size_t             ready;
+    ngx_queue_t                     buffers;
+    ngx_queue_t                     available;
+    ngx_queue_t                     pending;
+    ngx_chain_t                    *receiving;
+
+    ngx_int_t                       allocated;
+    size_t                          size;
+    size_t                          reserved;
+    size_t                          committed;
+    size_t                          ready;
+
+    /*
+     * closed stops admission; complete exposes terminal status after input
+     * and required writes have drained.  done records explicit input-filter
+     * completion independently of the remaining body length.
+     */
+
+    unsigned                        closed:1;
+    unsigned                        done:1;
+    unsigned                        eof:1;
+    unsigned                        error:1;
+    unsigned                        complete:1;
+    unsigned                        cancelled:1;
 } ngx_event_pipe_input_t;
 
 
@@ -54,8 +70,8 @@ typedef struct {
 
 
 static ngx_int_t ngx_event_pipe_input_advance(ngx_event_pipe_t *p, size_t n);
-static ngx_int_t ngx_event_pipe_input_publish(ngx_event_pipe_t *p,
-    size_t n, ngx_uint_t seal);
+static ngx_int_t ngx_event_pipe_input_publish(ngx_event_pipe_t *p, size_t n,
+    ngx_uint_t seal);
 static ngx_int_t ngx_event_pipe_input_preread(ngx_event_pipe_t *p);
 static size_t ngx_event_pipe_input_full(ngx_event_pipe_t *p);
 static ngx_buf_t *ngx_event_pipe_input_next(ngx_event_pipe_t *p);
@@ -66,6 +82,7 @@ static void ngx_event_pipe_input_reset(ngx_event_pipe_t *p,
 static void ngx_event_pipe_input_queue(ngx_event_pipe_t *p,
     ngx_event_pipe_input_block_t *b);
 static ngx_uint_t ngx_event_pipe_input_blocked(ngx_event_pipe_t *p);
+static void ngx_event_pipe_socket_notify(void *data);
 
 static ngx_int_t ngx_event_pipe_read_upstream(ngx_event_pipe_t *p);
 static ngx_int_t ngx_event_pipe_read_socket(ngx_event_pipe_t *p);
@@ -90,18 +107,40 @@ ngx_int_t
 ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 {
     ngx_int_t     rc;
-    ngx_uint_t    flags;
+    ngx_uint_t    flags, busy;
     ngx_event_t  *rev, *wev;
 
-    if (p->input == NULL && ngx_event_pipe_input_init(p) != NGX_OK) {
-        return NGX_ABORT;
+    if (p->input == NULL) {
+        if (ngx_event_pipe_input_init(p, ngx_event_pipe_socket_notify, p)
+            != NGX_OK)
+        {
+            return NGX_ABORT;
+        }
     }
 
     if (p->busy) {
         do_write = 1;
     }
 
+    /*
+     * A caller may report EOF or error while received input is still pending.
+     * Keep terminal flags private until filtering and required writes finish.
+     */
+
+    if (!p->input->complete) {
+        p->input->done |= p->upstream_done;
+        p->input->eof |= p->upstream_eof;
+        p->input->error |= p->upstream_error;
+        p->input->closed |= p->upstream_done || p->upstream_eof
+                            || p->upstream_error;
+        p->upstream_done = 0;
+        p->upstream_eof = 0;
+        p->upstream_error = 0;
+    }
+
     for ( ;; ) {
+        busy = 0;
+
         if (do_write) {
             p->log->action = "sending to client";
 
@@ -112,7 +151,7 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
             }
 
             if (rc == NGX_BUSY) {
-                return NGX_OK;
+                busy = 1;
             }
         }
 
@@ -125,7 +164,11 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
             return NGX_ABORT;
         }
 
-        if (!p->read && !p->upstream_blocked) {
+        /* A completed read still requires the terminal output handoff. */
+
+        if ((busy && !p->input->complete)
+            || (!p->read && !p->upstream_blocked))
+        {
             break;
         }
 
@@ -146,7 +189,10 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
         }
 
         if (!rev->delayed) {
-            if (rev->active && !rev->ready) {
+            if (rev->active && !rev->ready
+                && !p->input->closed
+                && !p->input->cancelled)
+            {
                 ngx_add_timer(rev, p->read_timeout);
 
             } else if (rev->timer_set) {
@@ -178,7 +224,8 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 
 
 ngx_int_t
-ngx_event_pipe_input_init(ngx_event_pipe_t *p)
+ngx_event_pipe_input_init(ngx_event_pipe_t *p,
+    ngx_event_pipe_input_notify_pt notify, void *data)
 {
     ngx_event_pipe_input_t  *in;
 
@@ -191,10 +238,20 @@ ngx_event_pipe_input_init(ngx_event_pipe_t *p)
         return NGX_ERROR;
     }
 
+    in->notify = notify;
+    in->data = data;
     ngx_queue_init(&in->buffers);
     ngx_queue_init(&in->available);
     ngx_queue_init(&in->pending);
     p->input = in;
+    p->preread = (p->preread_bufs != NULL);
+
+    /* Adopt preread storage before producers can query or reserve capacity. */
+
+    if (p->preread_bufs && ngx_event_pipe_input_preread(p) != NGX_OK) {
+        ngx_event_pipe_input_cancel(p);
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -210,6 +267,7 @@ ngx_event_pipe_input_reserve(ngx_event_pipe_t *p, ngx_uint_t n)
 
     if (p->bufs.num <= 0 || p->bufs.size == 0
         || n > (ngx_uint_t) p->bufs.num || in->receiving
+        || in->cancelled || in->closed
         || p->bufs.size > NGX_MAX_SIZE_T_VALUE / (size_t) p->bufs.num)
     {
         return NGX_ERROR;
@@ -251,6 +309,10 @@ ngx_event_pipe_input_capacity(ngx_event_pipe_t *p, size_t *size)
         *size = in->size;
     }
 
+    if (in->cancelled || in->closed) {
+        return 0;
+    }
+
     n = 0;
 
     for (q = ngx_queue_head(&in->available);
@@ -281,7 +343,7 @@ ngx_event_pipe_input_alloc_bufs(ngx_event_pipe_t *p, size_t limit)
 
     in = p->input;
 
-    if (in->receiving || limit == 0) {
+    if (in->receiving || limit == 0 || in->cancelled || in->closed) {
         return NULL;
     }
 
@@ -343,7 +405,12 @@ ngx_event_pipe_input_advance(ngx_event_pipe_t *p, size_t n)
 
     in = p->input;
 
-    if (in->receiving == NULL || n > in->reserved) {
+    /*
+     * A filter may close admission while the producer owns a receive.
+     * The producer must still be able to commit it or return it unused.
+     */
+
+    if (in->receiving == NULL || n > in->reserved || in->cancelled) {
         return NGX_ERROR;
     }
 
@@ -353,7 +420,8 @@ ngx_event_pipe_input_advance(ngx_event_pipe_t *p, size_t n)
     for (cl = in->receiving; cl; cl = next) {
         next = cl->next;
         b = (ngx_event_pipe_input_block_t *)
-                ((u_char *) cl - offsetof(ngx_event_pipe_input_block_t, receive));
+                 ((u_char *) cl
+                  - offsetof(ngx_event_pipe_input_block_t, receive));
 
         size = ngx_min(n, b->reserved);
         b->last += size;
@@ -391,7 +459,7 @@ ngx_event_pipe_input_publish(ngx_event_pipe_t *p, size_t n, ngx_uint_t seal)
 
     in = p->input;
 
-    if (in->receiving || n > in->committed - in->ready) {
+    if (in->receiving || n > in->committed - in->ready || in->cancelled) {
         return NGX_ERROR;
     }
 
@@ -413,6 +481,92 @@ ngx_event_pipe_input_publish(ngx_event_pipe_t *p, size_t n, ngx_uint_t seal)
     }
 
     return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_event_pipe_input_finish(ngx_event_pipe_t *p, ngx_uint_t flags)
+{
+    ngx_event_pipe_input_t  *in;
+
+    in = p->input;
+
+    if (in->complete) {
+        return NGX_BUSY;
+    }
+
+    if (in->cancelled || in->receiving
+        || (flags != NGX_EVENT_PIPE_INPUT_EOF
+            && flags != NGX_EVENT_PIPE_INPUT_ERROR))
+    {
+        return NGX_ERROR;
+    }
+
+    /*
+     * All receive views have been returned.  Publish remaining bytes before
+     * closing admission so the terminal status cannot overtake them.
+     */
+
+    if (ngx_event_pipe_input_publish(p, in->committed - in->ready, 1)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* A later EOF must not erase a reported error. */
+
+    if (flags == NGX_EVENT_PIPE_INPUT_ERROR) {
+        in->error = 1;
+        in->eof = 0;
+
+    } else if (!in->error) {
+        in->eof = 1;
+    }
+
+    in->closed = 1;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_event_pipe_input_cancel(ngx_event_pipe_t *p)
+{
+    ngx_queue_t                   *q;
+    ngx_event_pipe_input_t        *in;
+    ngx_event_pipe_input_block_t  *b;
+
+    in = p->input;
+
+    /*
+     * The producer has stopped using its receive views.  Detach notifications
+     * and discard unfiltered input, leaving published prefixes owned by
+     * downstream shadows and any outstanding file write.
+     */
+
+    in->cancelled = 1;
+    in->notify = NULL;
+    in->data = NULL;
+    in->receiving = NULL;
+    in->reserved = 0;
+    in->committed = 0;
+    in->ready = 0;
+
+    for (q = ngx_queue_head(&in->buffers);
+         q != ngx_queue_sentinel(&in->buffers);
+         q = ngx_queue_next(q))
+    {
+        b = ngx_queue_data(q, ngx_event_pipe_input_block_t, buffers);
+        b->reserved = 0;
+
+        if (b->queued) {
+            ngx_queue_remove(&b->pending);
+            b->queued = 0;
+        }
+
+        b->ready = b->pos;
+        b->last = b->pos;
+    }
 }
 
 
@@ -453,7 +607,7 @@ ngx_event_pipe_input_next(ngx_event_pipe_t *p)
 
     in = p->input;
 
-    if (ngx_queue_empty(&in->pending)) {
+    if (in->cancelled || ngx_queue_empty(&in->pending)) {
         return NULL;
     }
 
@@ -489,8 +643,10 @@ ngx_event_pipe_input_next(ngx_event_pipe_t *p)
 static void
 ngx_event_pipe_input_release(ngx_event_pipe_t *p, ngx_buf_t *buf)
 {
+    ngx_event_pipe_input_t        *in;
     ngx_event_pipe_input_block_t  *b;
 
+    in = p->input;
     b = (ngx_event_pipe_input_block_t *) buf;
 
     if (!b->busy) {
@@ -502,6 +658,16 @@ ngx_event_pipe_input_release(ngx_event_pipe_t *p, ngx_buf_t *buf)
 
     if (!b->queued && !b->reserved) {
         ngx_event_pipe_input_reset(p, b);
+    }
+
+    /*
+     * A tail can be committed while an earlier prefix is retained.  Releasing
+     * that prefix unblocks publication without adding capacity.  Only report
+     * progress here; the callback must not reenter the pipe.
+     */
+
+    if (in->notify) {
+        in->notify(in->data);
     }
 }
 
@@ -563,11 +729,14 @@ ngx_event_pipe_input_preread(ngx_event_pipe_t *p)
 static void
 ngx_event_pipe_input_reclaim(ngx_event_pipe_t *p)
 {
+    u_char                        *last;
+    ngx_uint_t                     changed;
     ngx_queue_t                   *q;
     ngx_event_pipe_input_t        *in;
     ngx_event_pipe_input_block_t  *b;
 
     in = p->input;
+    changed = 0;
 
     for (q = ngx_queue_head(&in->buffers);
          q != ngx_queue_sentinel(&in->buffers);
@@ -593,7 +762,15 @@ ngx_event_pipe_input_reclaim(ngx_event_pipe_t *p)
             continue;
         }
 
+        last = b->last;
         ngx_event_pipe_input_reset(p, b);
+        changed |= (last != b->last);
+    }
+
+    /* Coalesce restored capacity into one notification after the scan. */
+
+    if (changed && in->notify) {
+        in->notify(in->data);
     }
 }
 
@@ -630,7 +807,14 @@ ngx_event_pipe_input_queue(ngx_event_pipe_t *p,
 static ngx_int_t
 ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 {
-    ngx_int_t  rc;
+    ngx_int_t                rc;
+    ngx_event_pipe_input_t  *in;
+
+    in = p->input;
+
+    if (in->cancelled || in->complete) {
+        return NGX_OK;
+    }
 
 #if (NGX_THREADS)
 
@@ -647,6 +831,10 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 
 #endif
 
+    if (p->length == 0) {
+        in->closed = 1;
+    }
+
     rc = ngx_event_pipe_read_socket(p);
 
     if (rc == NGX_ABORT) {
@@ -657,13 +845,9 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
         return NGX_ABORT;
     }
 
-    if (p->length == 0 && !p->upstream_done) {
-        p->upstream_done = 1;
-        p->read = 1;
-    }
-
     if ((p->cacheable && (p->in || p->buf_to_file))
-        || (p->in && ngx_event_pipe_input_capacity(p, NULL) == 0
+        || (p->in && !in->closed
+            && ngx_event_pipe_input_capacity(p, NULL) == 0
             && p->temp_file->offset < p->max_temp_file_size
             && (p->downstream_error
                 || p->downstream->data != p->output_ctx
@@ -681,6 +865,23 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
             return rc;
         }
 
+        p->read = 1;
+    }
+
+    /*
+     * Terminal status follows all accepted input and required file writes.
+     * Downstream may still retain published buffers; the final output handoff
+     * handles their ownership without delaying input completion.
+     */
+
+    if (in->closed
+        && in->committed == 0 && in->receiving == NULL && !p->writing
+        && (!p->cacheable || (p->in == NULL && p->buf_to_file == NULL)))
+    {
+        p->upstream_done = in->done || p->length == 0;
+        p->upstream_eof = in->eof;
+        p->upstream_error = in->error;
+        in->complete = 1;
         p->read = 1;
     }
 
@@ -706,7 +907,7 @@ ngx_event_pipe_input_blocked(ngx_event_pipe_t *p)
 
     in = p->input;
 
-    if (ngx_queue_empty(&in->pending)) {
+    if (in->cancelled || ngx_queue_empty(&in->pending)) {
         return 0;
     }
 
@@ -714,6 +915,15 @@ ngx_event_pipe_input_blocked(ngx_event_pipe_t *p)
     b = ngx_queue_data(q, ngx_event_pipe_input_block_t, pending);
 
     return b->busy && b->pos != b->ready;
+}
+
+
+static void
+ngx_event_pipe_socket_notify(void *data)
+{
+    ngx_event_pipe_t  *p = data;
+
+    p->read = 1;
 }
 
 
@@ -730,8 +940,9 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
     ngx_chain_t  *cl;
 #endif
 
-    if (p->upstream_eof || p->upstream_error || p->upstream_done
-        || p->upstream == NULL)
+    if (p->input->closed
+        || p->upstream == NULL
+        || p->input->cancelled)
     {
         return NGX_OK;
     }
@@ -751,23 +962,20 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
 
     for ( ;; ) {
 
-        if (p->upstream_eof || p->upstream_error || p->upstream_done) {
+        if (p->input->closed) {
             break;
         }
 
-        if (p->preread_bufs == NULL && !p->upstream->read->ready) {
+        if (!p->preread && !p->upstream->read->ready) {
             break;
         }
 
-        if (p->preread_bufs) {
+        if (p->preread) {
 
-            /* use the pre-read bufs if they exist */
+            /* Apply socket batching and rate accounting to adopted preread. */
 
             n = p->preread_size;
-
-            if (ngx_event_pipe_input_preread(p) != NGX_OK) {
-                return NGX_ABORT;
-            }
+            p->preread = 0;
 
             ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                            "pipe preread: %z", n);
@@ -795,18 +1003,23 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
             {
                 p->upstream->read->ready = 0;
                 p->upstream->read->eof = 1;
-                p->upstream_eof = 1;
                 p->read = 1;
 
                 if (p->upstream->read->kq_errno) {
                     p->upstream->read->error = 1;
-                    p->upstream_error = 1;
-                    p->upstream_eof = 0;
-
                     ngx_log_error(NGX_LOG_ERR, p->log,
                                   p->upstream->read->kq_errno,
                                   "kevent() reported that upstream "
                                   "closed connection");
+                }
+
+                if (ngx_event_pipe_input_finish(p,
+                                                p->upstream->read->error
+                                                ? NGX_EVENT_PIPE_INPUT_ERROR
+                                                : NGX_EVENT_PIPE_INPUT_EOF)
+                    != NGX_OK)
+                {
+                    return NGX_ABORT;
                 }
 
                 break;
@@ -920,7 +1133,11 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
             }
 
             if (n == NGX_ERROR) {
-                p->upstream_error = 1;
+                if (ngx_event_pipe_input_finish(p, NGX_EVENT_PIPE_INPUT_ERROR)
+                    != NGX_OK)
+                {
+                    return NGX_ABORT;
+                }
                 break;
             }
 
@@ -931,7 +1148,11 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
             p->read = 1;
 
             if (n == 0) {
-                p->upstream_eof = 1;
+                if (ngx_event_pipe_input_finish(p, NGX_EVENT_PIPE_INPUT_EOF)
+                    != NGX_OK)
+                {
+                    return NGX_ABORT;
+                }
                 break;
             }
         }
@@ -1002,7 +1223,7 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
 #endif
 
     if (p->input->committed
-        && (p->upstream_eof || p->upstream_error
+        && (p->input->eof || p->input->error
             || (p->length != -1
                 && (off_t) p->input->committed >= p->length)))
     {
@@ -1026,12 +1247,56 @@ ngx_event_pipe_read_socket(ngx_event_pipe_t *p)
 static ngx_int_t
 ngx_event_pipe_filter_input(ngx_event_pipe_t *p)
 {
-    ngx_buf_t  *buf;
+    ngx_int_t                rc;
+    ngx_buf_t               *buf;
+    ngx_event_pipe_input_t  *in;
 
-    while ((buf = ngx_event_pipe_input_next(p)) != NULL) {
+    in = p->input;
+
+    for ( ;; ) {
+        if (in->closed && in->receiving == NULL
+            && in->committed != in->ready)
+        {
+            if (ngx_event_pipe_input_publish(p, in->committed - in->ready, 1)
+                != NGX_OK)
+            {
+                return NGX_ABORT;
+            }
+        }
+
+        buf = ngx_event_pipe_input_next(p);
+        if (buf == NULL) {
+            break;
+        }
+
         /* STUB */ buf->num = p->num++;
 
-        if (p->input_filter(p, buf) == NGX_ERROR) {
+        /*
+         * Filters inspect and update the public terminal flags.  Expose the
+         * saved status during the callback, then retain its result privately
+         * until all accepted input and required writes have been processed.
+         */
+
+        p->upstream_done = in->done;
+        p->upstream_eof = in->eof;
+        p->upstream_error = in->error;
+
+        rc = p->input_filter(p, buf);
+
+        in->done = p->upstream_done;
+        in->eof = p->upstream_eof;
+        in->error = p->upstream_error;
+        in->closed |= in->done || in->eof || in->error || p->length == 0;
+        p->upstream_done = 0;
+        p->upstream_eof = 0;
+        p->upstream_error = 0;
+
+        if (rc == NGX_ERROR) {
+            in->error = 1;
+            in->closed = 1;
+
+            /* Keep receive and published-buffer ownership until teardown. */
+
             return NGX_ABORT;
         }
 
