@@ -5278,7 +5278,8 @@ static ngx_int_t
 ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
     ngx_http_proxy_v2_stream_t *stream)
 {
-    size_t  n, window;
+    size_t             n, window, capacity;
+    ngx_event_pipe_t  *p;
 
     if (stream) {
         if (!stream->header_sent || stream->input_closed || stream->rst
@@ -5290,6 +5291,18 @@ ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
 
         if (ngx_http_proxy_v2_window_available(sess, stream, &n) != NGX_OK) {
             return NGX_ERROR;
+        }
+
+        /* Batch against the fixed reservation, not its writable remainder. */
+
+        p = stream->request->upstream->pipe;
+        capacity = ngx_min(p->bufs.size * p->bufs.num, NGX_HTTP_V2_MAX_WINDOW);
+        window = stream->recv_window + stream->recv_queued;
+
+        /* Low credit must make progress even with a sub-batch replenishment. */
+
+        if (n < capacity / 2 && window > NGX_HTTP_V2_DEFAULT_FRAME_SIZE) {
+            return NGX_OK;
         }
 
     } else {
