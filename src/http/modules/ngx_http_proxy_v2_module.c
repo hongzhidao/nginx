@@ -38,6 +38,7 @@ typedef enum {
 
 
 typedef struct {
+    ngx_rbtree_node_t              node;
     ngx_connection_t              *connection;
 
     ngx_rbtree_t                   streams;
@@ -87,6 +88,7 @@ typedef struct {
     unsigned                       field_huffman:1;
     unsigned                       header_discard:1;
     unsigned                       goaway:1;
+    unsigned                       registered:1;
 } ngx_http_proxy_v2_session_t;
 
 
@@ -241,10 +243,11 @@ static ngx_chain_t *ngx_http_proxy_v2_get_buf(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
 static void ngx_http_proxy_v2_detach_stream(
     ngx_http_proxy_v2_stream_t *stream);
+static ngx_rbtree_key_t ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u);
 static ngx_http_proxy_v2_session_t *
-    ngx_http_proxy_v2_find_session(ngx_connection_t *c);
+    ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u);
 static ngx_http_proxy_v2_session_t *
-    ngx_http_proxy_v2_create_session(ngx_connection_t *c);
+    ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u);
 static ngx_int_t ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc,
     void *data);
 static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
@@ -264,6 +267,8 @@ static void ngx_http_proxy_v2_session_cleanup(void *data);
 static void ngx_http_proxy_v2_abort_request(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r,
     ngx_int_t rc);
+static ngx_int_t ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle);
+static void ngx_http_proxy_v2_exit_process(ngx_cycle_t *cycle);
 
 
 static ngx_http_module_t  ngx_http_proxy_v2_module_ctx = {
@@ -288,13 +293,17 @@ ngx_module_t  ngx_http_proxy_v2_module = {
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
     NULL,                                  /* init module */
-    NULL,                                  /* init process */
+    ngx_http_proxy_v2_init_process,        /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
+    ngx_http_proxy_v2_exit_process,        /* exit process */
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+
+static ngx_rbtree_t       ngx_http_proxy_v2_sessions;
+static ngx_rbtree_node_t  ngx_http_proxy_v2_sessions_sentinel;
 
 
 static u_char  ngx_http_proxy_v2_connection_start[] =
@@ -4981,7 +4990,7 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
-    session = ngx_http_proxy_v2_find_session(c);
+    session = ngx_http_proxy_v2_find_session(r->upstream);
     if (session == NULL) {
         if (pc->cached) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
@@ -4989,7 +4998,7 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
             return NGX_DECLINED;
         }
 
-        session = ngx_http_proxy_v2_create_session(c);
+        session = ngx_http_proxy_v2_create_session(r->upstream);
         if (session == NULL) {
             return NGX_ERROR;
         }
@@ -5059,14 +5068,47 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
 }
 
 
-static ngx_http_proxy_v2_session_t *
-ngx_http_proxy_v2_find_session(ngx_connection_t *c)
+static ngx_rbtree_key_t
+ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u)
 {
-    ngx_pool_cleanup_t  *cln;
+    return ngx_crc32_short((u_char *) u->peer.sockaddr, u->peer.socklen);
+}
 
-    for (cln = c->pool->cleanup; cln; cln = cln->next) {
-        if (cln->handler == ngx_http_proxy_v2_session_cleanup) {
-            return cln->data;
+
+static ngx_http_proxy_v2_session_t *
+ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u)
+{
+    ngx_rbtree_key_t              key;
+    ngx_rbtree_node_t            *node, *first, *sentinel;
+    ngx_http_proxy_v2_session_t  *session;
+
+    key = ngx_http_proxy_v2_session_key(u);
+    node = ngx_http_proxy_v2_sessions.root;
+    sentinel = ngx_http_proxy_v2_sessions.sentinel;
+    first = NULL;
+
+    /* Equal keys can be on either side after tree rotations. */
+
+    while (node != sentinel) {
+        if (key > node->key) {
+            node = node->right;
+
+        } else {
+            if (key == node->key) {
+                first = node;
+            }
+
+            node = node->left;
+        }
+    }
+
+    for (node = first; node && node->key == key;
+         node = ngx_rbtree_next(&ngx_http_proxy_v2_sessions, node))
+    {
+        session = ngx_rbtree_data(node, ngx_http_proxy_v2_session_t, node);
+
+        if (session->connection == u->peer.connection) {
+            return session;
         }
     }
 
@@ -5075,10 +5117,13 @@ ngx_http_proxy_v2_find_session(ngx_connection_t *c)
 
 
 static ngx_http_proxy_v2_session_t *
-ngx_http_proxy_v2_create_session(ngx_connection_t *c)
+ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u)
 {
+    ngx_connection_t             *c;
     ngx_pool_cleanup_t           *cln;
     ngx_http_proxy_v2_session_t  *session;
+
+    c = u->peer.connection;
 
     cln = ngx_pool_cleanup_add(c->pool, sizeof(ngx_http_proxy_v2_session_t));
     if (cln == NULL) {
@@ -5097,6 +5142,10 @@ ngx_http_proxy_v2_create_session(ngx_connection_t *c)
     session->recv_window = NGX_HTTP_V2_MAX_WINDOW;
 
     cln->handler = ngx_http_proxy_v2_session_cleanup;
+
+    session->node.key = ngx_http_proxy_v2_session_key(u);
+    ngx_rbtree_insert(&ngx_http_proxy_v2_sessions, &session->node);
+    session->registered = 1;
 
     return session;
 }
@@ -5174,9 +5223,12 @@ ngx_http_proxy_v2_save_session(ngx_peer_connection_t *pc, void *data)
 static void
 ngx_http_proxy_v2_session_cleanup(void *data)
 {
-    /* identifies the session in the connection pool */
+    ngx_http_proxy_v2_session_t  *session = data;
 
-    return;
+    if (session->registered) {
+        ngx_rbtree_delete(&ngx_http_proxy_v2_sessions, &session->node);
+        session->registered = 0;
+    }
 }
 
 
@@ -5195,4 +5247,33 @@ ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "finalize proxy http2 request");
     return;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle)
+{
+    /* Preserve registrations across single-process configuration reloads. */
+
+    ngx_rbtree_init(&ngx_http_proxy_v2_sessions,
+                    &ngx_http_proxy_v2_sessions_sentinel,
+                    ngx_rbtree_insert_value);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_exit_process(ngx_cycle_t *cycle)
+{
+    ngx_rbtree_node_t            *node;
+    ngx_http_proxy_v2_session_t  *session;
+
+    while (ngx_http_proxy_v2_sessions.root
+           != ngx_http_proxy_v2_sessions.sentinel)
+    {
+        node = ngx_http_proxy_v2_sessions.root;
+        session = ngx_rbtree_data(node, ngx_http_proxy_v2_session_t, node);
+        ngx_http_proxy_v2_session_cleanup(session);
+    }
 }
