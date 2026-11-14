@@ -7432,14 +7432,7 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
             return;
         }
 
-        if (ngx_http_proxy_v2_send_expired(stream)) {
-            /* This callback is already delivering the timeout. */
-
-            if (ev->posted) {
-                ngx_delete_posted_event(ev);
-            }
-
-        } else if (ev->timedout) {
+        if (!ngx_http_proxy_v2_send_expired(stream) && ev->timedout) {
             ngx_http_proxy_v2_write_timer(stream->request);
             return;
         }
@@ -7448,10 +7441,6 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
     }
 
     if (ngx_http_proxy_v2_read_expired(stream)) {
-        if (ev->posted) {
-            ngx_delete_posted_event(ev);
-        }
-
         goto done;
     }
 
