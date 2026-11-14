@@ -140,6 +140,7 @@ typedef struct {
     ngx_event_t                    idle_timer;
     ngx_msec_t                     output_deadline;
     ngx_msec_t                     control_deadline;
+    ngx_msec_t                     idle_deadline;
     ngx_buf_t                     *buffer;
     ngx_http_proxy_v2_control_t   *input_reply;
     ngx_uint_t                     input_stream_id;
@@ -527,6 +528,7 @@ static void ngx_http_proxy_v2_remove_idle(ngx_http_proxy_v2_session_t *session);
 #if (NGX_HTTP_UPSTREAM_KEEPALIVE)
 static void ngx_http_proxy_v2_evict(ngx_connection_t *c);
 #endif
+static void ngx_http_proxy_v2_idle_session(ngx_http_proxy_v2_session_t *session);
 static void ngx_http_proxy_v2_idle_timeout(ngx_event_t *ev);
 static ngx_int_t ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc,
     void *data);
@@ -6361,6 +6363,7 @@ ngx_http_proxy_v2_write_handler(ngx_event_t *ev)
         }
     }
 
+    ngx_http_proxy_v2_idle_session(sess);
     ngx_http_proxy_v2_release_session(sess);
 }
 
@@ -6958,6 +6961,7 @@ ngx_http_proxy_v2_read_handler(ngx_event_t *ev)
         ngx_http_proxy_v2_close_session(sess);
     }
 
+    ngx_http_proxy_v2_idle_session(sess);
     ngx_http_proxy_v2_release_session(sess);
 }
 
@@ -8219,12 +8223,9 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
 {
     ngx_http_proxy_v2_peer_t  *peer = data;
 
-    ngx_msec_t                          timeout;
-    ngx_connection_t                   *c;
     ngx_http_upstream_t                *u;
     ngx_http_proxy_v2_stream_t         *stream;
     ngx_http_proxy_v2_session_t        *session;
-    ngx_http_proxy_v2_srv_conf_t       *conf;
     const ngx_http_upstream_keepalive_conf_t  *kcf;
 
     u = peer->request->upstream;
@@ -8271,13 +8272,59 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     pc->connection = NULL;
     peer->free(pc, peer->data, state);
 
+    kcf = session->keepalive;
+    if (kcf) {
+        session->idle_deadline = ngx_current_msec + kcf->timeout;
+    }
+
+    ngx_http_proxy_v2_idle_session(session);
+
+    if (session->idle) {
+        ngx_http_proxy_v2_post_read(session);
+    }
+
+    ngx_http_proxy_v2_release_session(session);
+}
+
+
+#if (NGX_HTTP_UPSTREAM_KEEPALIVE)
+
+static void
+ngx_http_proxy_v2_evict(ngx_connection_t *c)
+{
+    ngx_http_proxy_v2_close_session(c->data);
+}
+
+#endif
+
+
+static void
+ngx_http_proxy_v2_idle_session(ngx_http_proxy_v2_session_t *session)
+{
+    ngx_msec_t                          timeout;
+    ngx_connection_t                   *c;
+    ngx_http_proxy_v2_srv_conf_t       *conf;
+    const ngx_http_upstream_keepalive_conf_t  *kcf;
+
+    if (session->nstreams || session->idle || session->closing
+        || session->finishing)
+    {
+        return;
+    }
+
     c = session->connection;
 
     if (ngx_http_proxy_v2_retain_session(session) != NGX_OK
+        || (ngx_msec_int_t) (session->idle_deadline - ngx_current_msec) <= 0
         || ngx_handle_read_event(c->read, 0) != NGX_OK)
     {
         ngx_http_proxy_v2_finish_session(session);
-        ngx_http_proxy_v2_release_session(session);
+        return;
+    }
+
+    /* Output owners keep the writer and their existing deadlines active. */
+
+    if (ngx_http_proxy_v2_output_pending(session)) {
         return;
     }
 
@@ -8289,7 +8336,7 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
                                                        ngx_http_proxy_v2_evict);
 #endif
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, &session->log, 0,
                    "http2 pool saving connection %p", c);
 
     if (c->read->timer_set) {
@@ -8306,25 +8353,10 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_queue_insert_head(&conf->idle, &session->queue);
     session->idle = 1;
 
-    timeout = ngx_min(kcf->timeout,
-                     kcf->time - (ngx_current_msec - c->start_time));
+    timeout = ngx_min(session->idle_deadline - ngx_current_msec,
+                      kcf->time - (ngx_current_msec - c->start_time));
     ngx_add_timer(&session->idle_timer, timeout);
-
-    ngx_http_proxy_v2_post_read(session);
-
-    ngx_http_proxy_v2_release_session(session);
 }
-
-
-#if (NGX_HTTP_UPSTREAM_KEEPALIVE)
-
-static void
-ngx_http_proxy_v2_evict(ngx_connection_t *c)
-{
-    ngx_http_proxy_v2_close_session(c->data);
-}
-
-#endif
 
 
 static void
