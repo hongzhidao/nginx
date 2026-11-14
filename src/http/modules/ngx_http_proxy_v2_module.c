@@ -8182,8 +8182,7 @@ ngx_http_proxy_v2_reusable_session(ngx_http_proxy_v2_session_t *session,
     }
 
     if (session->state != ngx_http_proxy_v2_st_start
-        || session->header_stream_id || session->write.posted
-        || session->read.posted || session->input_stream_id
+        || session->header_stream_id || session->input_stream_id
         || ngx_http_proxy_v2_output_pending(session)
         || (session->buffer && session->buffer->pos != session->buffer->last))
     {
