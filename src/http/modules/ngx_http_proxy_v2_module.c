@@ -2245,6 +2245,9 @@ static ngx_int_t
 ngx_http_proxy_v2_filter_init(void *data)
 {
     ngx_http_request_t          *r = data;
+    size_t                       size, maximum;
+    ngx_uint_t                   n;
+    ngx_event_pipe_t            *p;
     ngx_http_upstream_t         *u;
     ngx_http_proxy_v2_ctx_t     *ctx;
     ngx_http_proxy_v2_stream_t  *stream;
@@ -2257,9 +2260,6 @@ ngx_http_proxy_v2_filter_init(void *data)
     }
 
     stream = ctx->stream;
-
-    stream->body_started = 1;
-    ngx_post_event(&stream->read, &ngx_posted_events);
 
     if (u->headers_in.status_n == NGX_HTTP_NO_CONTENT
         || u->headers_in.status_n == NGX_HTTP_NOT_MODIFIED
@@ -2275,8 +2275,29 @@ ngx_http_proxy_v2_filter_init(void *data)
         return NGX_ERROR;
     }
 
+    p = u->pipe;
+
+    if (!stream->input_closed && !stream->failure) {
+        maximum = p->bufs.size * p->bufs.num;
+        size = maximum;
+
+        if (stream->length >= 0 && (uint64_t) stream->length < maximum) {
+            size = (size_t) stream->length;
+            size += ngx_min((size_t) 256, maximum - size);
+        }
+
+        n = 1 + (size - 1) / p->bufs.size;
+
+        if (ngx_event_pipe2_input_reserve(p, n) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
     u->length = stream->done ? 0 : 1;
-    u->pipe->length = u->length;
+    p->length = u->length;
+
+    stream->body_started = 1;
+    ngx_post_event(&stream->read, &ngx_posted_events);
 
     ngx_http_proxy_v2_read_timer(r);
 
@@ -5306,10 +5327,11 @@ ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
             return NGX_ERROR;
         }
 
-        /* Batch against the fixed reservation, not its writable remainder. */
+        /* Batch against allocated storage, not its writable remainder. */
 
         p = stream->request->upstream->pipe;
-        capacity = ngx_min(p->bufs.size * p->bufs.num, NGX_HTTP_V2_MAX_WINDOW);
+        (void) ngx_event_pipe2_input_capacity(p, &capacity);
+        capacity = ngx_min(capacity, NGX_HTTP_V2_MAX_WINDOW);
         window = stream->recv_window + stream->recv_queued;
 
         /* Low credit must make progress even with a sub-batch replenishment. */
@@ -8562,9 +8584,20 @@ static ngx_int_t
 ngx_http_proxy_v2_init_input(ngx_http_request_t *r,
     ngx_http_proxy_v2_stream_t *stream)
 {
+    size_t             size;
+    ngx_uint_t         n;
     ngx_event_pipe_t  *p;
 
     p = r->upstream->pipe;
+    n = 1;
+
+    if (ngx_event_pipe2_input_initialized(p)) {
+        (void) ngx_event_pipe2_input_capacity(p, &size);
+        if (size) {
+            n = 1 + (size - 1) / r->upstream->conf->bufs.size;
+            n = ngx_min(n, (ngx_uint_t) r->upstream->conf->bufs.num);
+        }
+    }
 
     /*
      * Retries detach the old stream before preparing this attempt.  They occur
@@ -8594,7 +8627,7 @@ ngx_http_proxy_v2_init_input(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    return ngx_event_pipe2_input_reserve(p, p->bufs.num);
+    return ngx_event_pipe2_input_reserve(p, n);
 }
 
 
