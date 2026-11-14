@@ -18,6 +18,10 @@ static ngx_int_t ngx_event_pipe_output_chain(ngx_event_pipe_t *p,
 static ngx_int_t ngx_event_pipe_recycle_buffers(ngx_event_pipe_t *p);
 
 static ngx_int_t ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p);
+static ngx_int_t ngx_event_pipe_prepare_temp_file_write(ngx_event_pipe_t *p,
+    ngx_chain_t **chain);
+static ngx_int_t ngx_event_pipe_update_temp_file_bufs(ngx_event_pipe_t *p,
+    ngx_chain_t *out, ssize_t n);
 static ngx_inline void ngx_event_pipe_remove_shadow_links(ngx_buf_t *buf);
 static ngx_int_t ngx_event_pipe_drain_chains(ngx_event_pipe_t *p);
 
@@ -788,10 +792,9 @@ ngx_event_pipe_recycle_buffers(ngx_event_pipe_t *p)
 static ngx_int_t
 ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p)
 {
-    ssize_t       size, bsize, n;
-    ngx_buf_t    *b;
-    ngx_uint_t    prev_last_shadow;
-    ngx_chain_t  *cl, *tl, *next, *out, **ll, **last_out, **last_free;
+    ssize_t       n;
+    ngx_int_t     rc;
+    ngx_chain_t  *out;
 
 #if (NGX_THREADS)
 
@@ -810,10 +813,53 @@ ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p)
             return NGX_ABORT;
         }
 
-        goto done;
+        return ngx_event_pipe_update_temp_file_bufs(p, out, n);
     }
 
 #endif
+
+    rc = ngx_event_pipe_prepare_temp_file_write(p, &out);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+#if (NGX_THREADS)
+    if (p->thread_handler) {
+        p->temp_file->thread_write = 1;
+        p->temp_file->file.thread_task = p->thread_task;
+        p->temp_file->file.thread_handler = p->thread_handler;
+        p->temp_file->file.thread_ctx = p->thread_ctx;
+    }
+#endif
+
+    n = ngx_write_chain_to_temp_file(p->temp_file, out);
+
+    if (n == NGX_ERROR) {
+        return NGX_ABORT;
+    }
+
+#if (NGX_THREADS)
+
+    if (n == NGX_AGAIN) {
+        p->writing = out;
+        p->thread_task = p->temp_file->file.thread_task;
+        return NGX_AGAIN;
+    }
+
+#endif
+
+    return ngx_event_pipe_update_temp_file_bufs(p, out, n);
+}
+
+
+static ngx_int_t
+ngx_event_pipe_prepare_temp_file_write(ngx_event_pipe_t *p,
+    ngx_chain_t **chain)
+{
+    ssize_t       size, bsize;
+    ngx_uint_t    prev_last_shadow;
+    ngx_chain_t  *cl, *out, **ll;
 
     if (p->buf_to_file) {
         out = ngx_alloc_chain_link(p->pool);
@@ -882,32 +928,18 @@ ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p)
         p->last_in = &p->in;
     }
 
-#if (NGX_THREADS)
-    if (p->thread_handler) {
-        p->temp_file->thread_write = 1;
-        p->temp_file->file.thread_task = p->thread_task;
-        p->temp_file->file.thread_handler = p->thread_handler;
-        p->temp_file->file.thread_ctx = p->thread_ctx;
-    }
-#endif
+    *chain = out;
 
-    n = ngx_write_chain_to_temp_file(p->temp_file, out);
+    return NGX_OK;
+}
 
-    if (n == NGX_ERROR) {
-        return NGX_ABORT;
-    }
 
-#if (NGX_THREADS)
-
-    if (n == NGX_AGAIN) {
-        p->writing = out;
-        p->thread_task = p->temp_file->file.thread_task;
-        return NGX_AGAIN;
-    }
-
-done:
-
-#endif
+static ngx_int_t
+ngx_event_pipe_update_temp_file_bufs(ngx_event_pipe_t *p, ngx_chain_t *out,
+    ssize_t n)
+{
+    ngx_buf_t    *b;
+    ngx_chain_t  *cl, *tl, *next, **last_out, **last_free;
 
     if (p->buf_to_file) {
         p->temp_file->offset = p->buf_to_file->last - p->buf_to_file->pos;
