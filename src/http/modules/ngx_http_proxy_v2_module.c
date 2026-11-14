@@ -285,15 +285,6 @@ typedef struct {
 
 
 typedef struct {
-    ngx_http_proxy_v2_session_t   *session;
-    ngx_http_proxy_v2_stream_t    *stream;
-    ngx_event_pipe_t              *pipe;
-    unsigned                       input_initialized:1;
-    unsigned                       reuse:1;
-} ngx_http_proxy_v2_stream_init_t;
-
-
-typedef struct {
     ngx_buf_t                     *buf;
     u_char                        *pos;
     u_char                        *last;
@@ -369,13 +360,6 @@ static ngx_int_t ngx_http_proxy_v2_init_stream(ngx_http_request_t *r);
 static ngx_int_t ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     ngx_http_proxy_v2_peer_t *peer, ngx_http_proxy_v2_session_t *session,
     ngx_uint_t reuse);
-static ngx_int_t ngx_http_proxy_v2_prepare_stream(ngx_http_request_t *r,
-    ngx_http_proxy_v2_session_t *session, ngx_uint_t reuse,
-    ngx_http_proxy_v2_stream_init_t *init);
-static ngx_int_t ngx_http_proxy_v2_commit_stream(ngx_http_proxy_v2_peer_t *peer,
-    ngx_http_proxy_v2_stream_init_t *init);
-static void ngx_http_proxy_v2_abort_stream(
-    ngx_http_proxy_v2_stream_init_t *init);
 static void ngx_http_proxy_v2_connection_handler(ngx_event_t *ev);
 static void ngx_http_proxy_v2_stream_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_proxy_v2_read_response(
@@ -7798,35 +7782,11 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     ngx_http_proxy_v2_peer_t *peer, ngx_http_proxy_v2_session_t *session,
     ngx_uint_t reuse)
 {
-    ngx_int_t                        rc;
-    ngx_http_proxy_v2_stream_init_t  init;
-
-    /* Initialization cannot yield; commit or abort consumes temporary owners. */
-
-    rc = ngx_http_proxy_v2_prepare_stream(r, session, reuse, &init);
-    if (rc != NGX_OK) {
-        return rc;
-    }
-
-    rc = ngx_http_proxy_v2_commit_stream(peer, &init);
-    if (rc != NGX_OK) {
-        ngx_http_proxy_v2_abort_stream(&init);
-    }
-
-    return rc;
-}
-
-
-static ngx_int_t
-ngx_http_proxy_v2_prepare_stream(ngx_http_request_t *r,
-    ngx_http_proxy_v2_session_t *session, ngx_uint_t reuse,
-    ngx_http_proxy_v2_stream_init_t *init)
-{
-    size_t                        budget;
-    ngx_int_t                     rc;
-    ngx_http_proxy_v2_stream_t   *stream;
-
-    ngx_memzero(init, sizeof(ngx_http_proxy_v2_stream_init_t));
+    size_t                       budget;
+    ngx_int_t                    rc;
+    ngx_event_pipe_t            *p;
+    ngx_http_upstream_t         *u;
+    ngx_http_proxy_v2_stream_t  *stream;
 
     if ((reuse ? ngx_http_proxy_v2_reusable_session(session, 0)
                : ngx_http_proxy_v2_stream_capacity(session, 0))
@@ -7844,10 +7804,8 @@ ngx_http_proxy_v2_prepare_stream(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    init->session = session;
-    init->stream = stream;
-    init->pipe = r->upstream->pipe;
-    init->reuse = reuse;
+    u = r->upstream;
+    p = u->pipe;
     session->ref_count++;
 
     stream->request = r;
@@ -7855,50 +7813,27 @@ ngx_http_proxy_v2_prepare_stream(ngx_http_request_t *r,
 
     rc = ngx_http_proxy_v2_reserve_reset(session, &stream->reset);
     if (rc != NGX_OK) {
-        ngx_http_proxy_v2_abort_stream(init);
-        return rc;
+        goto failed;
     }
 
     rc = ngx_http_proxy_v2_init_input(r, stream);
-    init->pipe = r->upstream->pipe;
-    init->input_initialized = (init->pipe->input != NULL);
+    p = u->pipe;
 
     if (rc != NGX_OK) {
-        ngx_http_proxy_v2_abort_stream(init);
-        return NGX_ERROR;
+        ngx_event_pipe_input_cancel(p);
+        goto failed;
     }
 
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_http_proxy_v2_commit_stream(ngx_http_proxy_v2_peer_t *peer,
-    ngx_http_proxy_v2_stream_init_t *init)
-{
-    ngx_http_upstream_t          *u;
-    ngx_http_proxy_v2_stream_t   *stream;
-    ngx_http_proxy_v2_session_t  *session;
-
-    session = init->session;
-    stream = init->stream;
-
-    if (session == NULL || stream == NULL || !init->input_initialized
-        || stream->reset == NULL || !stream->reset->reserved)
-    {
-        return NGX_ERROR;
-    }
-
-    if ((init->reuse ? ngx_http_proxy_v2_reusable_session(session, 1)
-                     : ngx_http_proxy_v2_stream_capacity(session, 1))
+    if ((reuse ? ngx_http_proxy_v2_reusable_session(session, 1)
+               : ngx_http_proxy_v2_stream_capacity(session, 1))
         != NGX_OK)
     {
-        return NGX_BUSY;
+        ngx_event_pipe_input_cancel(p);
+        rc = NGX_BUSY;
+        goto failed;
     }
 
     /* All remaining work is infallible; transfer the preparation reference. */
-
-    u = stream->request->upstream;
 
     stream->session = session;
     stream->id = session->last_stream_id ? session->last_stream_id + 2 : 1;
@@ -7921,14 +7856,24 @@ ngx_http_proxy_v2_commit_stream(ngx_http_proxy_v2_peer_t *peer,
     peer->stream = stream;
 
     u->peer.connection = session->connection;
-    u->peer.cached = init->reuse;
+    u->peer.cached = reuse;
 
     ngx_http_proxy_v2_restore_request(peer->ctx);
     ngx_http_proxy_v2_init_stream_connection(stream);
 
-    ngx_memzero(init, sizeof(ngx_http_proxy_v2_stream_init_t));
-
     return NGX_OK;
+
+failed:
+
+    if (stream->reset) {
+        stream->reset->reserved = 0;
+        ngx_http_proxy_v2_release_reset(session, stream->reset);
+        stream->reset = NULL;
+    }
+
+    ngx_http_proxy_v2_release_session(session);
+
+    return rc;
 }
 
 
@@ -7974,34 +7919,6 @@ ngx_http_proxy_v2_input_handler(void *data)
     ngx_http_proxy_v2_stream_t  *stream = data;
 
     ngx_post_event(&stream->read, &ngx_posted_events);
-}
-
-
-static void
-ngx_http_proxy_v2_abort_stream(ngx_http_proxy_v2_stream_init_t *init)
-{
-    ngx_http_proxy_v2_stream_t   *stream;
-    ngx_http_proxy_v2_session_t  *session;
-
-    session = init->session;
-    if (session == NULL) {
-        return;
-    }
-
-    if (init->input_initialized) {
-        ngx_event_pipe_input_cancel(init->pipe);
-    }
-
-    stream = init->stream;
-
-    if (stream->reset) {
-        stream->reset->reserved = 0;
-        ngx_http_proxy_v2_release_reset(session, stream->reset);
-        stream->reset = NULL;
-    }
-
-    ngx_memzero(init, sizeof(ngx_http_proxy_v2_stream_init_t));
-    ngx_http_proxy_v2_release_session(session);
 }
 
 
