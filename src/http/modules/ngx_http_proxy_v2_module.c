@@ -162,6 +162,7 @@ typedef struct {
     ngx_event_t                    output_timer;
     ngx_event_t                    control_timer;
     ngx_event_t                    read;
+    ngx_event_t                    next_read;
     ngx_event_t                    idle_timer;
     ngx_msec_t                     output_deadline;
     ngx_msec_t                     startup_deadline;
@@ -559,6 +560,7 @@ static void ngx_http_proxy_v2_update_control_timer(
     ngx_http_proxy_v2_session_t *sess);
 static void ngx_http_proxy_v2_post_read(ngx_http_proxy_v2_session_t *sess);
 static void ngx_http_proxy_v2_read_handler(ngx_event_t *ev);
+static void ngx_http_proxy_v2_next_read_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_proxy_v2_read_stream(
     ngx_http_proxy_v2_stream_t *stream);
 static void ngx_http_proxy_v2_release_input(ngx_http_proxy_v2_session_t *sess);
@@ -7306,7 +7308,12 @@ static void
 ngx_http_proxy_v2_post_read(ngx_http_proxy_v2_session_t *sess)
 {
     if (!sess->closing && !sess->input_blocked) {
-        ngx_post_event(&sess->read, &ngx_posted_next_events);
+        if (sess->input_yield) {
+            ngx_post_event(&sess->next_read, &ngx_posted_next_events);
+
+        } else {
+            ngx_post_event(&sess->read, &ngx_posted_events);
+        }
     }
 }
 
@@ -7321,6 +7328,8 @@ ngx_http_proxy_v2_check_input_budget(ngx_http_proxy_v2_session_t *sess)
         ngx_http_proxy_v2_post_read(sess);
         return NGX_AGAIN;
     }
+
+    /* Charge parser steps and owner redispatches, including no-progress work. */
 
     sess->parse_count++;
     return NGX_OK;
@@ -7354,6 +7363,10 @@ ngx_http_proxy_v2_read_session(ngx_http_proxy_v2_session_t *sess,
     }
 
     if (sess->input_stream_id) {
+        if (ngx_http_proxy_v2_check_input_budget(sess) != NGX_OK) {
+            return NGX_AGAIN;
+        }
+
         *stream = ngx_http_proxy_v2_find_stream(sess, sess->input_stream_id);
         return NGX_DECLINED;
     }
@@ -7849,6 +7862,26 @@ ngx_http_proxy_v2_handle_session_read(ngx_http_proxy_v2_session_t *sess,
 
 
 static void
+ngx_http_proxy_v2_next_read_handler(ngx_event_t *ev)
+{
+    ngx_http_proxy_v2_session_t  *sess = ev->data;
+
+    if (sess->closing) {
+        return;
+    }
+
+    /* Only this next-turn event replenishes the shared input budget. */
+
+    sess->input_yield = 0;
+    sess->input_frames = 0;
+    sess->parse_count = 0;
+    sess->input_bytes = 0;
+
+    ngx_http_proxy_v2_post_read(sess);
+}
+
+
+static void
 ngx_http_proxy_v2_read_handler(ngx_event_t *ev)
 {
     ngx_http_proxy_v2_session_t  *sess = ev->data;
@@ -7866,13 +7899,6 @@ ngx_http_proxy_v2_read_handler(ngx_event_t *ev)
     }
 
     sess->ref_count++;
-
-    /* Only this next-turn continuation replenishes the shared input budget. */
-
-    sess->input_yield = 0;
-    sess->input_frames = 0;
-    sess->parse_count = 0;
-    sess->input_bytes = 0;
 
     rc = ngx_http_proxy_v2_read_session(sess, &stream);
 
@@ -8904,6 +8930,10 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
     session->read.data = session;
     session->read.log = &session->log;
 
+    session->next_read.handler = ngx_http_proxy_v2_next_read_handler;
+    session->next_read.data = session;
+    session->next_read.log = &session->log;
+
     session->output_timer.handler = ngx_http_proxy_v2_output_timeout;
     session->output_timer.data = session;
     session->output_timer.log = &session->log;
@@ -9221,6 +9251,10 @@ ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
 
     if (session->read.posted) {
         ngx_delete_posted_event(&session->read);
+    }
+
+    if (session->next_read.posted) {
+        ngx_delete_posted_event(&session->next_read);
     }
 
     if (session->write.posted) {
