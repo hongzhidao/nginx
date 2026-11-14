@@ -108,11 +108,12 @@ typedef struct {
     ngx_http_proxy_v2_srv_conf_t  *srv_conf;
     ngx_http_upstream_srv_conf_t  *upstream;
     ngx_http_upstream_conf_t      *conf;
-    const ngx_http_upstream_keepalive_conf_t
-                                 *keepalive;
+
+    const ngx_http_upstream_keepalive_conf_t  *keepalive;
 #if (NGX_HTTP_UPSTREAM_KEEPALIVE)
     ngx_http_upstream_keepalive_cache_t       *idle_slot;
 #endif
+
     ngx_sockaddr_t                 sockaddr;
     socklen_t                      socklen;
 
@@ -389,8 +390,8 @@ static void ngx_http_proxy_v2_set_write_handler(
     ngx_connection_t *c, ngx_event_handler_pt handler);
 static ssize_t ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf,
     size_t size);
-static ssize_t ngx_http_proxy_v2_recv_chain(ngx_connection_t *c,
-    ngx_chain_t *in, off_t limit);
+static ssize_t ngx_http_proxy_v2_read_payload(
+    ngx_http_proxy_v2_stream_t *stream, u_char *buf, size_t size);
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
@@ -7397,7 +7398,6 @@ ngx_http_proxy_v2_init_stream_connection(ngx_http_proxy_v2_stream_t *stream)
     sc->read = &stream->read;
     sc->write = &stream->write;
     sc->recv = ngx_http_proxy_v2_recv;
-    sc->recv_chain = ngx_http_proxy_v2_recv_chain;
     sc->sendfile = c->sendfile && r->connection->sendfile;
     sc->number = c->number;
     sc->start_time = c->start_time;
@@ -7622,7 +7622,8 @@ ngx_http_proxy_v2_read_response(ngx_http_proxy_v2_stream_t *stream)
             return NGX_ERROR;
         }
 
-        n = stream->connection.recv_chain(&stream->connection, chain, size);
+        size = chain->buf->end - chain->buf->last;
+        n = ngx_http_proxy_v2_read_payload(stream, chain->buf->last, size);
         if (n < 0) {
             rc = n;
             break;
@@ -7683,21 +7684,20 @@ ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf, size_t size)
 
 
 static ssize_t
-ngx_http_proxy_v2_recv_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, u_char *buf,
+    size_t size)
 {
     ssize_t                       n;
     ngx_int_t                     rc;
     ngx_http_request_t           *r;
-    ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *sess;
 
-    stream = (ngx_http_proxy_v2_stream_t *) c;
     sess = stream->session;
     r = stream->request;
 
     /* The caller borrowed a bounded tail; commit before any fallible work. */
 
-    n = sess->connection->recv_chain(sess->connection, in, limit);
+    n = sess->connection->recv(sess->connection, buf, size);
 
     if (n > 0) {
         rc = ngx_http_proxy_v2_commit_data(stream, n);
@@ -7740,7 +7740,7 @@ ngx_http_proxy_v2_recv_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         }
 
         rc = ngx_http_proxy_v2_handle_session_read(sess, n);
-        c->read->ready = 0;
+        stream->read.ready = 0;
 
         if (rc == NGX_ERROR) {
             ngx_http_proxy_v2_close_session(sess);
@@ -8347,10 +8347,11 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
                                                      ngx_http_proxy_v2_module);
     }
 
-    session->upstream = u->upstream;
 #if (NGX_HTTP_UPSTREAM_KEEPALIVE)
     session->keepalive = ngx_http_upstream_get_keepalive_conf(u->upstream);
 #endif
+
+    session->upstream = u->upstream;
     session->conf = u->conf;
     session->socklen = pc->socklen;
     ngx_memcpy(&session->sockaddr, pc->sockaddr, pc->socklen);
@@ -8982,9 +8983,9 @@ ngx_http_proxy_v2_evict(ngx_connection_t *c)
 static void
 ngx_http_proxy_v2_idle_session(ngx_http_proxy_v2_session_t *session)
 {
-    ngx_msec_t                                timeout;
-    ngx_connection_t                         *c;
-    ngx_http_proxy_v2_srv_conf_t             *conf;
+    ngx_msec_t                                 timeout;
+    ngx_connection_t                          *c;
+    ngx_http_proxy_v2_srv_conf_t              *conf;
     const ngx_http_upstream_keepalive_conf_t  *kcf;
 
     if (session->nstreams || session->idle || session->closing
