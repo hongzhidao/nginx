@@ -7879,11 +7879,13 @@ ngx_http_proxy_v2_read_input(ngx_http_proxy_v2_session_t *sess)
 static ngx_int_t
 ngx_http_proxy_v2_read_data(ngx_http_proxy_v2_stream_t *stream)
 {
-    size_t                        size, tail;
+    size_t                        size, tail, rest, limit, preread;
     ssize_t                       n;
     ngx_int_t                     rc;
     ngx_uint_t                    nbufs;
+    ngx_buf_t                    *b, preread_buf;
     ngx_chain_t                  *chain, *cl, *next;
+    ngx_chain_t                   preread_chain;
     ngx_connection_t             *c;
     ngx_event_pipe_t             *p;
     ngx_http_proxy_v2_session_t  *sess;
@@ -7891,9 +7893,11 @@ ngx_http_proxy_v2_read_data(ngx_http_proxy_v2_stream_t *stream)
     sess = stream->session;
     c = sess->connection;
     p = stream->request->upstream->pipe;
+    b = sess->buffer;
 
-    size = ngx_min(sess->rest - sess->padding,
-                  NGX_HTTP_PROXY_V2_READ_LIMIT - sess->input_bytes);
+    rest = sess->rest - sess->padding;
+    limit = NGX_HTTP_PROXY_V2_READ_LIMIT - sess->input_bytes;
+    size = ngx_min(rest, limit);
     chain = ngx_event_pipe_input_alloc_bufs(p, size);
 
     if (chain == NULL) {
@@ -7902,23 +7906,43 @@ ngx_http_proxy_v2_read_data(ngx_http_proxy_v2_stream_t *stream)
         return NGX_ERROR;
     }
 
-    /* Only this frame's body may enter the reserved pipe tails. */
+    b->pos = b->last = b->start;
+    preread = ngx_min(NGX_HTTP_PROXY_V2_READ_PREREAD, limit - size);
+    preread = ngx_min(preread, (size_t) (b->end - b->start));
 
     tail = chain->buf->end - chain->buf->last;
 
-    if (size <= tail) {
+    if (size <= tail && preread == 0) {
         n = c->recv(c, chain->buf->last, size);
 
     } else {
-        for (nbufs = 1, cl = chain; cl->next; cl = cl->next) {
-            if (nbufs++ == NGX_HTTP_PROXY_V2_READ_BUFS) {
+        size = 0;
+
+        for (nbufs = 1, cl = chain; /* void */; cl = cl->next, nbufs++) {
+            size += cl->buf->end - cl->buf->last;
+
+            if (cl->next == NULL || nbufs == NGX_HTTP_PROXY_V2_READ_BUFS) {
+                next = cl->next;
+                cl->next = NULL;
                 break;
             }
         }
 
-        next = cl->next;
-        cl->next = NULL;
-        n = c->recv_chain(c, chain, size);
+        /* Framing may follow only a complete view of this frame's body. */
+
+        if (size != rest) {
+            preread = 0;
+        }
+
+        if (preread) {
+            cl->next = &preread_chain;
+            preread_chain.buf = &preread_buf;
+            preread_chain.next = NULL;
+            preread_buf = *b;
+            preread_buf.end = b->start + preread;
+        }
+
+        n = c->recv_chain(c, chain, size + preread);
 
         /* Restore the input's receive chain before settling its reservation. */
 
@@ -7933,18 +7957,21 @@ ngx_http_proxy_v2_read_data(ngx_http_proxy_v2_stream_t *stream)
         return ngx_http_proxy_v2_handle_session_read(sess, n);
     }
 
-    /* Commit before event rearming or any other fallible work. */
+    /* Publish both destinations before rearming or other fallible work. */
 
-    rc = ngx_http_proxy_v2_commit_data(stream, n);
+    size = ngx_min((size_t) n, size);
+    b->last += n - size;
+
+    rc = ngx_http_proxy_v2_commit_data(stream, size);
     (void) ngx_http_proxy_v2_handle_session_read(sess, n);
 
     if (rc != NGX_OK) {
         return rc;
     }
 
-    /* RX is empty: settle this frame even at a read-budget boundary. */
+    /* Settle this frame, including preread padding, before yielding. */
 
-    rc = ngx_http_proxy_v2_process_data_frame(sess, sess->buffer, stream);
+    rc = ngx_http_proxy_v2_process_data_frame(sess, b, stream);
 
     if (rc != NGX_ERROR) {
         ngx_http_proxy_v2_update_read_timers(sess);
