@@ -3624,7 +3624,6 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     p->tag = u->output.tag;
     p->bufs = u->conf->bufs;
     p->busy_size = u->conf->busy_buffers_size;
-    p->upstream = u->connection;
     p->downstream = c;
     p->pool = r->pool;
     p->log = c->log;
@@ -3670,17 +3669,10 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     }
 #endif
 
-    p->preread_bufs = ngx_alloc_chain_link(r->pool);
-    if (p->preread_bufs == NULL) {
+    if (ngx_event_pipe_init_source(p, u->connection, &u->buffer) != NGX_OK) {
         ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
         return;
     }
-
-    p->preread_bufs->buf = &u->buffer;
-    p->preread_bufs->next = NULL;
-    u->buffer.recycled = 1;
-
-    p->preread_size = u->buffer.last - u->buffer.pos;
 
     if (u->cacheable) {
 
@@ -3695,15 +3687,6 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         p->buf_to_file->last = u->buffer.pos;
         p->buf_to_file->temporary = 1;
     }
-
-    /* TODO: p->free_bufs = 0 if use ngx_create_chain_of_bufs() */
-    p->free_bufs = 1;
-
-    /*
-     * event_pipe would do u->buffer.last += p->preread_size
-     * as though these bytes were read
-     */
-    u->buffer.last = u->buffer.pos;
 
     if (u->conf->cyclic_temp_file) {
 
@@ -4193,11 +4176,7 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
         return;
     }
 
-    if (!upstream->read->ready
-        && (upstream->read->active
-            || (!upstream->transport && !upstream->read->eof
-                && !upstream->read->error && u->length != 0 && !u->error)))
-    {
+    if (upstream->read->active && !upstream->read->ready) {
         ngx_add_timer(upstream->read, u->conf->read_timeout);
 
     } else if (upstream->read->timer_set) {

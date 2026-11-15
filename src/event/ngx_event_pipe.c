@@ -20,6 +20,34 @@ static ngx_int_t ngx_event_pipe_drain_chains(ngx_event_pipe_t *p);
 
 
 ngx_int_t
+ngx_event_pipe_init_source(ngx_event_pipe_t *p, ngx_connection_t *c,
+    ngx_buf_t *header)
+{
+    if (p->ops) {
+        /* Producer input already owns all body bytes. */
+        return header->pos == header->last ? NGX_OK : NGX_ERROR;
+    }
+
+    p->preread_bufs = ngx_alloc_chain_link(p->pool);
+    if (p->preread_bufs == NULL) {
+        return NGX_ERROR;
+    }
+
+    p->upstream = c;
+    p->preread_bufs->buf = header;
+    p->preread_bufs->next = NULL;
+    p->preread_size = header->last - header->pos;
+    p->free_bufs = 1;
+
+    /* read_upstream() will advance last as if it had read these bytes. */
+    header->recycled = 1;
+    header->last = header->pos;
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
 ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 {
     ngx_int_t     rc;
@@ -62,7 +90,7 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     }
 
     if (p->upstream
-        && (p->upstream->fd != (ngx_socket_t) -1 || !p->upstream->transport))
+        && p->upstream->fd != (ngx_socket_t) -1)
     {
         rev = p->upstream->read;
 
@@ -72,17 +100,8 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
             return NGX_ABORT;
         }
 
-        if (!p->upstream->transport
-            && (p->upstream_done || p->upstream_eof || p->upstream_error))
-        {
-            rev->delayed = 0;
-
-            if (rev->timer_set) {
-                ngx_del_timer(rev);
-            }
-
-        } else if (!rev->delayed) {
-            if ((rev->active || !p->upstream->transport) && !rev->ready) {
+        if (!rev->delayed) {
+            if (rev->active && !rev->ready) {
                 ngx_add_timer(rev, p->read_timeout);
 
             } else if (rev->timer_set) {
