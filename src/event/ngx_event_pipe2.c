@@ -11,6 +11,10 @@
 #include <ngx_event.h>
 #include <ngx_event_pipe2.h>
 
+#if (NGX_THREADS)
+#include <ngx_thread_pool.h>
+#endif
+
 
 typedef struct ngx_event_pipe2_block_s  ngx_event_pipe2_block_t;
 
@@ -18,7 +22,8 @@ typedef struct ngx_event_pipe2_block_s  ngx_event_pipe2_block_t;
  * A block has one output owner and an independent receive view.  The private
  * cursors describe bytes not yet handed off: start <= pos <= last <= end.
  * A retained output prefix does not take away the writable tail.  Its next
- * publication to the output filter waits for that prefix.
+ * publication to the output filter waits for that prefix.  At capacity a full
+ * block's receive view can instead spill its unpublished tail in FIFO order.
  */
 
 struct ngx_event_pipe2_block_s {
@@ -36,8 +41,15 @@ struct ngx_event_pipe2_block_s {
     size_t                     reserved;
 
     unsigned                   busy:1;
+    unsigned                   spilling:1;
     unsigned                   in_queue:1;
 };
+
+
+typedef struct {
+    ngx_buf_t                  buf;
+    ngx_chain_t                chain;
+} ngx_event_pipe2_file_chain_t;
 
 
 typedef struct {
@@ -60,6 +72,15 @@ typedef struct {
     ngx_chain_t                    *busy;
     ngx_chain_t                   **last_busy;
 
+    ngx_event_pipe2_file_chain_t    file_chains[2];
+    ngx_chain_t                    *free_file;
+    ngx_chain_t                     cache_header;
+    size_t                          cache_header_size;
+    size_t                          file_write_size;
+    ngx_file_t                      read_file;
+    ngx_chain_t                    *file_out;
+    ngx_uint_t                      file_busy;
+
     ngx_int_t                       terminal;
     unsigned                        initialized:1;
     unsigned                        complete:1;
@@ -70,9 +91,13 @@ typedef struct {
 
 static void ngx_event_pipe2_release_block(ngx_event_pipe2_t *q,
     ngx_event_pipe2_block_t *block);
-static ngx_chain_t *ngx_event_pipe2_take_chain(ngx_event_pipe2_t *q);
+static ngx_chain_t *ngx_event_pipe2_take_chain(ngx_event_pipe2_t *q,
+    ngx_uint_t spill);
 static ngx_uint_t ngx_event_pipe2_recycle_busy(ngx_event_pipe2_t *q);
 static void ngx_event_pipe2_discard(ngx_event_pipe2_t *q);
+static ngx_int_t ngx_event_pipe2_write_temp_file(ngx_event_pipe2_t *q);
+static void ngx_event_pipe2_release_file_chain(ngx_event_pipe2_t *q,
+    ngx_chain_t *cl);
 static ngx_int_t ngx_event_pipe2_output(ngx_event_pipe2_t *q,
     ngx_uint_t terminal, ngx_int_t flush);
 
@@ -88,6 +113,7 @@ static const ngx_event_pipe_ops_t  ngx_event_pipe2_ops = {
 ngx_event_pipe_t *
 ngx_event_pipe2_create(ngx_pool_t *pool)
 {
+    ngx_uint_t          i;
     ngx_event_pipe2_t  *q;
 
     q = ngx_pcalloc(pool, sizeof(ngx_event_pipe2_t));
@@ -99,6 +125,15 @@ ngx_event_pipe2_create(ngx_pool_t *pool)
     q->pipe.pool = pool;
     q->last_in = &q->in;
     q->last_busy = &q->busy;
+    q->read_file.fd = NGX_INVALID_FILE;
+
+    /* One submitted file extent and one accumulating extent suffice. */
+
+    for (i = 0; i < 2; i++) {
+        q->file_chains[i].chain.buf = &q->file_chains[i].buf;
+        q->file_chains[i].chain.next = q->free_file;
+        q->free_file = &q->file_chains[i].chain;
+    }
 
     return &q->pipe;
 }
@@ -375,7 +410,7 @@ ngx_event_pipe2_release_block(ngx_event_pipe2_t *q,
     block->busy = 0;
     q->progress = 1;
 
-    if (block->in_queue || block->reserved) {
+    if (block->in_queue || block->reserved || block->spilling) {
         return;
     }
 
@@ -392,7 +427,7 @@ ngx_event_pipe2_release_block(ngx_event_pipe2_t *q,
 
 
 static ngx_chain_t *
-ngx_event_pipe2_take_chain(ngx_event_pipe2_t *q)
+ngx_event_pipe2_take_chain(ngx_event_pipe2_t *q, ngx_uint_t spill)
 {
     ngx_buf_t                *b;
     ngx_chain_t              *cl;
@@ -407,9 +442,20 @@ ngx_event_pipe2_take_chain(ngx_event_pipe2_t *q)
 
     block->in_queue = 0;
 
-    block->busy = 1;
-    b = &block->output;
-    cl = &block->chain;
+    if (spill) {
+        /*
+         * At zero capacity all blocks are full and their receive views have
+         * been returned.  The output filter may still hold a prefix.
+         */
+        block->spilling = 1;
+        b = &block->recv_buf;
+        cl = &block->receive;
+
+    } else {
+        block->busy = 1;
+        b = &block->output;
+        cl = &block->chain;
+    }
 
     ngx_memzero(b, sizeof(ngx_buf_t));
     b->start = block->start;
@@ -441,11 +487,25 @@ ngx_event_pipe2_recycle_busy(ngx_event_pipe2_t *q)
         q->busy = cl->next;
         progress = 1;
 
-        ngx_event_pipe2_release_block(q, (ngx_event_pipe2_block_t *) cl->buf);
+        if (cl->buf->in_file) {
+            q->file_busy--;
+            cl->next = q->free_file;
+            q->free_file = cl;
+
+        } else {
+            ngx_event_pipe2_release_block(q,
+                                          (ngx_event_pipe2_block_t *) cl->buf);
+        }
     }
 
     if (q->busy == NULL) {
         q->last_busy = &q->busy;
+    }
+
+    if (!q->pipe.cacheable && q->pipe.cyclic_temp_file
+        && q->file_busy == 0 && q->file_out == NULL && !q->pipe.writing)
+    {
+        q->pipe.temp_file->offset = 0;
     }
 
     return progress;
@@ -456,6 +516,16 @@ static void
 ngx_event_pipe2_discard(ngx_event_pipe2_t *q)
 {
     ngx_event_pipe2_block_t  *block;
+
+    if (q->file_out) {
+        q->file_out->next = q->free_file;
+        q->free_file = q->file_out;
+        q->file_out = NULL;
+    }
+
+    if (q->pipe.cacheable && !q->cancelled) {
+        return;
+    }
 
     while (q->in) {
         block = q->in;
@@ -469,6 +539,179 @@ ngx_event_pipe2_discard(ngx_event_pipe2_t *q)
     }
 
     q->last_in = &q->in;
+}
+
+
+static ngx_int_t
+ngx_event_pipe2_write_temp_file(ngx_event_pipe2_t *q)
+{
+    size_t                    size, limit;
+    ssize_t                   n;
+    off_t                     offset;
+    ngx_buf_t                *buf;
+    ngx_chain_t              *cl, **last;
+    ngx_event_pipe_t         *p;
+    ngx_event_pipe2_block_t  *block;
+
+    p = &q->pipe;
+
+    if (p->writing) {
+#if (NGX_THREADS)
+        if (!p->temp_file->file.thread_task->event.complete) {
+            return NGX_AGAIN;
+        }
+#endif
+        n = ngx_write_chain_to_temp_file(p->temp_file, NULL);
+        goto done;
+    }
+
+    if (p->aio) {
+        return NGX_AGAIN;
+    }
+
+    limit = p->temp_file_write_size;
+    if (!p->cacheable) {
+        limit = ngx_min((off_t) limit,
+                       p->max_temp_file_size - p->temp_file->offset);
+    }
+
+    q->file_write_size = 0;
+    q->cache_header_size = 0;
+    last = &p->writing;
+
+    if (p->buf_to_file) {
+        q->cache_header.buf = p->buf_to_file;
+        q->cache_header.next = NULL;
+        q->cache_header_size = p->buf_to_file->last - p->buf_to_file->pos;
+        *last = &q->cache_header;
+        last = &q->cache_header.next;
+        q->file_write_size = q->cache_header_size;
+    }
+
+    while (q->in) {
+        block = q->in;
+        size = block->last - block->pos;
+
+        if (size > limit && (!p->cacheable || q->file_write_size)) {
+            break;
+        }
+
+        cl = ngx_event_pipe2_take_chain(q, !p->cacheable);
+        *last = cl;
+        last = &cl->next;
+        q->file_write_size += size;
+        limit -= ngx_min(size, limit);
+    }
+
+    if (p->writing == NULL) {
+        return NGX_BUSY;
+    }
+
+#if (NGX_THREADS)
+    if (p->thread_handler) {
+        p->temp_file->thread_write = 1;
+        p->temp_file->file.thread_handler = p->thread_handler;
+        p->temp_file->file.thread_ctx = p->thread_ctx;
+    }
+#endif
+
+    p->temp_file->file.sys_offset = -1;
+    n = ngx_write_chain_to_temp_file(p->temp_file, p->writing);
+
+    if (n == NGX_AGAIN) {
+        return NGX_AGAIN;
+    }
+
+done:
+
+    if (n == NGX_ERROR || n != (ssize_t) q->file_write_size) {
+        ngx_log_error(NGX_LOG_CRIT, p->log, 0,
+                      "pipe2 temporary file write failed: %z of %uz",
+                      n, q->file_write_size);
+        cl = p->writing;
+        p->writing = NULL;
+        if (p->buf_to_file) {
+            cl = cl->next;
+        }
+        ngx_event_pipe2_release_file_chain(q, cl);
+        return NGX_ABORT;
+    }
+
+    offset = p->temp_file->offset + q->cache_header_size;
+    p->temp_file->offset += n;
+
+    /* The same fd has separate read and write task ownership. */
+
+    if (q->read_file.fd == NGX_INVALID_FILE) {
+        q->read_file = p->temp_file->file;
+#if (NGX_THREADS)
+        q->read_file.thread_task = NULL;
+#endif
+    }
+
+    q->read_file.sys_offset = -1;
+
+    if ((off_t) n > (off_t) q->cache_header_size && !q->cancelled) {
+        if (q->file_out == NULL) {
+            cl = q->free_file;
+            if (cl == NULL) {
+                return NGX_ABORT;
+            }
+            q->free_file = cl->next;
+            cl->next = NULL;
+            q->file_out = cl;
+            buf = cl->buf;
+            ngx_memzero(buf, sizeof(ngx_buf_t));
+            buf->file = &q->read_file;
+            buf->file_pos = offset;
+            buf->in_file = 1;
+            buf->temp_file = 1;
+            buf->flush = 1;
+            buf->tag = p->tag;
+        }
+
+        q->file_out->buf->file_last = p->temp_file->offset;
+    }
+
+    cl = p->writing;
+    p->writing = NULL;
+
+    if (p->buf_to_file) {
+        p->buf_to_file = NULL;
+        cl = cl->next;
+    }
+
+    ngx_event_pipe2_release_file_chain(q, cl);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_event_pipe2_release_file_chain(ngx_event_pipe2_t *q, ngx_chain_t *cl)
+{
+    ngx_chain_t              *next;
+    ngx_event_pipe2_block_t  *block;
+
+    while (cl) {
+        next = cl->next;
+
+        if (q->pipe.cacheable) {
+            block = (ngx_event_pipe2_block_t *) cl->buf;
+            ngx_event_pipe2_release_block(q, block);
+
+        } else {
+            block = (ngx_event_pipe2_block_t *) ((u_char *) cl
+                                   - offsetof(ngx_event_pipe2_block_t, receive));
+            block->spilling = 0;
+
+            if (!block->busy) {
+                ngx_event_pipe2_release_block(q, block);
+            }
+        }
+
+        cl = next;
+    }
 }
 
 
@@ -490,15 +733,27 @@ ngx_event_pipe2_output(ngx_event_pipe2_t *q, ngx_uint_t terminal,
         if (terminal) {
             cl->buf->recycled = 0;
         }
-        busy += cl->buf->end - cl->buf->start;
+        if (!cl->buf->in_file) {
+            busy += cl->buf->end - cl->buf->start;
+        }
     }
 
-    while (q->in && !q->in->busy) {
+    if (q->file_out
+        && (q->file_busy == 0
+            || (terminal && (!p->cacheable || q->in == NULL))))
+    {
+        out = q->file_out;
+        q->file_out = NULL;
+        q->file_busy++;
+        last = &out->next;
+    }
+
+    while (!q->file_out && !p->cacheable && q->in && !q->in->busy) {
         if (!terminal && busy + p->bufs.size > (size_t) p->busy_size) {
             break;
         }
 
-        cl = ngx_event_pipe2_take_chain(q);
+        cl = ngx_event_pipe2_take_chain(q, 0);
         cl->buf->recycled = !terminal;
         *last = cl;
         last = &cl->next;
@@ -535,7 +790,7 @@ ngx_event_pipe2(ngx_event_pipe_t *p, ngx_int_t do_write)
 
     q = (ngx_event_pipe2_t *) p;
 
-    if (!q->initialized || p->downstream == NULL || p->cacheable) {
+    if (!q->initialized || p->downstream == NULL) {
         return NGX_ABORT;
     }
 
@@ -546,6 +801,17 @@ ngx_event_pipe2(ngx_event_pipe_t *p, ngx_int_t do_write)
 
     for ( ;; ) {
         progress = ngx_event_pipe2_recycle_busy(q);
+
+        if (p->writing) {
+            rc = ngx_event_pipe2_write_temp_file(q);
+            if (rc == NGX_ABORT) {
+                return NGX_ABORT;
+            }
+            if (rc == NGX_AGAIN) {
+                break;
+            }
+            progress = 1;
+        }
 
         if (q->cancelled) {
             break;
@@ -567,7 +833,26 @@ ngx_event_pipe2(ngx_event_pipe_t *p, ngx_int_t do_write)
             do_write = 0;
         }
 
-        if (terminal && q->in == NULL) {
+        /* Hand off completed output before starting another asynchronous write. */
+
+        if ((p->cacheable && (q->in || p->buf_to_file))
+            || (!p->cacheable && q->in && !q->terminal
+                && q->capacity == 0
+                && p->temp_file->offset < p->max_temp_file_size))
+        {
+            rc = ngx_event_pipe2_write_temp_file(q);
+            if (rc == NGX_ABORT) {
+                return NGX_ABORT;
+            }
+            if (rc == NGX_AGAIN) {
+                break;
+            }
+            progress |= (rc == NGX_OK);
+        }
+
+        if (terminal && q->in == NULL && q->file_out == NULL
+            && (!p->cacheable || p->buf_to_file == NULL))
+        {
             q->complete = 1;
             p->upstream_done = q->terminal == NGX_DONE;
             p->upstream_eof = p->upstream_done;

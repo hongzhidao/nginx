@@ -35,12 +35,12 @@ typedef void (*ngx_event_pipe2_notify_pt)(void *data);
  * finish() accepts NGX_DONE for EOF or NGX_ERROR for input failure.
  * EOF requires returned receives.  Error is allocation-free, can upgrade EOF,
  * and preserves active receive and output owners.  Completion follows accepted
- * bytes, but does not wait for downstream retention.
+ * bytes and required file writes, but does not wait for downstream retention.
  * The legacy upstream status fields are results, not input to this queue.
  *
  * Stop the producer and its scheduled work before cancel(), including on abort.
  * Cancellation is idempotent, prevents reopening, and preserves submitted output
- * buffers.  notify(data) coalesces possible progress at the end
+ * and outstanding writes.  notify(data) coalesces possible progress at the end
  * of a successful run; it must schedule work rather than reenter the queue.
  */
 
