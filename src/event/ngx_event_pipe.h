@@ -22,6 +22,16 @@ typedef ngx_int_t (*ngx_event_pipe_output_filter_pt)(void *data,
                                                      ngx_chain_t *chain);
 
 
+/* NULL selects the socket-driven pipe. */
+
+typedef struct {
+    ngx_int_t   (*run)(ngx_event_pipe_t *p, ngx_int_t do_write);
+    ngx_uint_t  (*input_complete)(ngx_event_pipe_t *p);
+    void        (*input_error)(ngx_event_pipe_t *p);
+    void        (*cancel)(ngx_event_pipe_t *p);
+} ngx_event_pipe_ops_t;
+
+
 struct ngx_event_pipe_s {
     ngx_connection_t  *upstream;
     ngx_connection_t  *downstream;
@@ -46,6 +56,8 @@ struct ngx_event_pipe_s {
 
     ngx_event_pipe_output_filter_pt   output_filter;
     void                             *output_ctx;
+
+    const ngx_event_pipe_ops_t       *ops;
 
 #if (NGX_THREADS || NGX_COMPAT)
     ngx_int_t                       (*thread_handler)(ngx_thread_task_t *task,
@@ -101,6 +113,11 @@ struct ngx_event_pipe_s {
 ngx_int_t ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write);
 ngx_int_t ngx_event_pipe_copy_input_filter(ngx_event_pipe_t *p, ngx_buf_t *buf);
 ngx_int_t ngx_event_pipe_add_free_buf(ngx_event_pipe_t *p, ngx_buf_t *b);
+
+
+ngx_uint_t ngx_event_pipe_input_complete(ngx_event_pipe_t *p);
+ngx_int_t ngx_event_pipe_input_error(ngx_event_pipe_t *p);
+void ngx_event_pipe_input_cancel(ngx_event_pipe_t *p);
 
 
 #endif /* _NGX_EVENT_PIPE_H_INCLUDED_ */
