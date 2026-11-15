@@ -26,6 +26,10 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     ngx_uint_t    flags;
     ngx_event_t  *rev, *wev;
 
+    if (p->ops) {
+        return p->ops->run(p, do_write);
+    }
+
     for ( ;; ) {
         if (do_write) {
             p->log->action = "sending to client";
@@ -97,6 +101,40 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     }
 
     return NGX_OK;
+}
+
+
+ngx_uint_t
+ngx_event_pipe_input_complete(ngx_event_pipe_t *p)
+{
+    if (p->ops) {
+        return p->ops->input_complete(p);
+    }
+
+    return p->upstream_done || p->upstream_eof || p->upstream_error;
+}
+
+
+ngx_int_t
+ngx_event_pipe_input_error(ngx_event_pipe_t *p)
+{
+    if (p->ops) {
+        p->ops->input_error(p);
+        return p->ops->run(p, 0);
+    }
+
+    p->upstream_error = 1;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_event_pipe_input_cancel(ngx_event_pipe_t *p)
+{
+    if (p->ops) {
+        p->ops->cancel(p);
+    }
 }
 
 
