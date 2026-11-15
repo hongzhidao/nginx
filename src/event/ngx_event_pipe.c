@@ -62,7 +62,8 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     }
 
     if (p->upstream
-        && p->upstream->fd != (ngx_socket_t) -1)
+        && (p->upstream->fd != (ngx_socket_t) -1
+            || ngx_connection_shared(p->upstream)))
     {
         rev = p->upstream->read;
 
@@ -72,8 +73,19 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
             return NGX_ABORT;
         }
 
-        if (!rev->delayed) {
-            if (rev->active && !rev->ready) {
+        if (ngx_connection_shared(p->upstream)
+            && (p->upstream_done || p->upstream_eof || p->upstream_error))
+        {
+            rev->delayed = 0;
+
+            if (rev->timer_set) {
+                ngx_del_timer(rev);
+            }
+
+        } else if (!rev->delayed) {
+            if ((rev->active || ngx_connection_shared(p->upstream))
+                && !rev->ready)
+            {
                 ngx_add_timer(rev, p->read_timeout);
 
             } else if (rev->timer_set) {
