@@ -4193,7 +4193,11 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
         return;
     }
 
-    if (upstream->read->active && !upstream->read->ready) {
+    if (!upstream->read->ready
+        && (upstream->read->active
+            || (!upstream->transport && !upstream->read->eof
+                && !upstream->read->error && u->length != 0 && !u->error)))
+    {
         ngx_add_timer(upstream->read, u->conf->read_timeout);
 
     } else if (upstream->read->timer_set) {

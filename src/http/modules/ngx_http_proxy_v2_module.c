@@ -22,6 +22,11 @@
     (ngx_align(sizeof(ngx_table_elt_t), NGX_ALIGNMENT)                         \
      + ngx_align(sizeof(ngx_list_part_t), NGX_ALIGNMENT))
 
+#define NGX_HTTP_PROXY_V2_MAX_CONTROL  64
+#define NGX_HTTP_PROXY_V2_SEND_LIMIT   65536
+#define NGX_HTTP_PROXY_V2_READ_LIMIT   65536
+#define NGX_HTTP_PROXY_V2_FRAME_LIMIT  32
+
 
 typedef enum {
     ngx_http_proxy_v2_st_start = 0,
@@ -41,6 +46,35 @@ typedef enum {
 typedef struct {
     ngx_queue_t                    idle;
 } ngx_http_proxy_v2_srv_conf_t;
+
+
+typedef enum {
+    ngx_http_proxy_v2_output_none = 0,
+    ngx_http_proxy_v2_output_preface,
+    ngx_http_proxy_v2_output_control,
+    ngx_http_proxy_v2_output_headers,
+    ngx_http_proxy_v2_output_data
+} ngx_http_proxy_v2_output_e;
+
+
+typedef struct {
+    ngx_http_proxy_v2_output_e     kind;
+    ngx_uint_t                     stream_id;
+    size_t                         length;
+    size_t                         payload;
+    ngx_buf_t                     *source;
+    ngx_str_t                      headers;
+    u_char                        *header_pos;
+    ngx_buf_t                      buf[2];
+    ngx_chain_t                    chain[2];
+    ngx_chain_t                   *out;
+    ngx_chain_t                   *control;
+    ngx_file_t                     file;
+    u_char                         frame[NGX_HTTP_V2_FRAME_HEADER_SIZE];
+    unsigned                       started:1;
+    unsigned                       file_owned:1;
+    unsigned                       end_stream:1;
+} ngx_http_proxy_v2_output_t;
 
 
 typedef struct {
@@ -63,11 +97,35 @@ typedef struct {
     int                            rcvbuf;
     int                            sndbuf;
 
+    ngx_log_t                      log;
     ngx_connection_t              *connection;
+    ngx_pool_t                    *pool;
+    ngx_queue_t                    sessions_queue;
+    ngx_uint_t                     ref_count;
+
+    ngx_buf_t                      preface;
+    ngx_http_proxy_v2_output_t     output;
+    u_char                        *send_buffer;
+
+    ngx_chain_t                   *control;
+    ngx_chain_t                  **control_last;
+    ngx_chain_t                   *control_free;
+    ngx_uint_t                     controls;
+    ngx_uint_t                     pending_controls;
+
+    ngx_event_t                    write;
+    ngx_event_t                    output_timer;
+    ngx_event_t                    control_timer;
+    ngx_event_t                    idle_read;
+    ngx_event_t                    idle_timer;
+    ngx_msec_t                     output_deadline;
+    ngx_msec_t                     control_deadline;
+    ngx_buf_t                     *buffer;
 
     ngx_rbtree_t                   streams;
     ngx_rbtree_node_t              sentinel;
     ngx_uint_t                     nstreams;
+    ngx_uint_t                     max_streams;
 
     ngx_http_proxy_v2_state_e      state;
     ngx_uint_t                     frame_state;
@@ -104,6 +162,7 @@ typedef struct {
     size_t                         send_window;
     size_t                         recv_window;
     ngx_uint_t                     last_stream_id;
+    ngx_uint_t                     last_opened_id;
 
     ngx_uint_t                     goaway_last_stream_id;
     ngx_uint_t                     goaway_error;
@@ -115,19 +174,28 @@ typedef struct {
     unsigned                       registered:1;
     unsigned                       idle:1;
     unsigned                       closing:1;
+    unsigned                       writing:1;
+    unsigned                       reading:1;
+    unsigned                       preface_sent:1;
+    unsigned                       finishing:1;
     unsigned                       transparent:1;
     unsigned                       so_keepalive:1;
 } ngx_http_proxy_v2_session_t;
 
 
 typedef struct {
+    ngx_connection_t               connection;
+    ngx_event_t                    read;
+    ngx_event_t                    write;
     ngx_rbtree_node_t              node;
     ngx_http_proxy_v2_session_t   *session;
+    ngx_http_request_t            *request;
     ngx_uint_t                     id;
 
     size_t                         header_budget;
 
     ngx_chain_t                   *in;
+    ngx_msec_t                     send_deadline;
 
     ssize_t                        send_window;
     size_t                         recv_window;
@@ -136,6 +204,7 @@ typedef struct {
 
     ngx_uint_t                     error;
 
+    unsigned                       header_started:1;
     unsigned                       header_sent:1;
     unsigned                       output_closed:1;
     unsigned                       response_received:1;
@@ -143,22 +212,17 @@ typedef struct {
     unsigned                       input_closed:1;
     unsigned                       done:1;
     unsigned                       rst:1;
+    unsigned                       send_waiting:1;
+    unsigned                       send_expired:1;
+    unsigned                       output_stopped:1;
 } ngx_http_proxy_v2_stream_t;
 
 
 typedef struct {
     ngx_http_proxy_ctx_t           ctx;
 
-    ngx_chain_t                   *out;
-    ngx_chain_t                   *free;
-    ngx_chain_t                   *busy;
-
     ngx_http_proxy_v2_stream_t    *stream;
 
-    ngx_uint_t                     pings;
-    ngx_uint_t                     settings;
-
-    unsigned                       output_blocked:1;
     unsigned                       status:1;
 #if (NGX_HTTP_CACHE)
     unsigned                       cache_header_failed:1;
@@ -210,9 +274,24 @@ static ngx_int_t ngx_http_proxy_v2_init_peer(ngx_http_request_t *r,
 static ngx_int_t ngx_http_proxy_v2_init_stream(ngx_http_request_t *r);
 static ngx_int_t ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     ngx_http_proxy_v2_peer_t *peer);
+static void ngx_http_proxy_v2_connection_handler(ngx_event_t *ev);
+static void ngx_http_proxy_v2_stream_handler(ngx_event_t *ev);
+static ngx_int_t ngx_http_proxy_v2_test_io(ngx_connection_t *c,
+    ngx_uint_t write);
+static void ngx_http_proxy_v2_set_read_handler(
+    ngx_connection_t *c, ngx_event_handler_pt handler);
+static void ngx_http_proxy_v2_set_write_handler(
+    ngx_connection_t *c, ngx_event_handler_pt handler);
+static ssize_t ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf,
+    size_t size);
+static ssize_t ngx_http_proxy_v2_recv_chain(ngx_connection_t *c,
+    ngx_chain_t *in, off_t limit);
+static ssize_t ngx_http_proxy_v2_handle_stream_read(ngx_connection_t *c,
+    ssize_t n);
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
+static ngx_int_t ngx_http_proxy_v2_process_headers(ngx_http_request_t *r);
 #if (NGX_HTTP_CACHE)
 static void ngx_http_proxy_v2_check_cache_format(ngx_http_request_t *r);
 static void ngx_http_proxy_v2_create_cache_header(ngx_http_request_t *r);
@@ -226,8 +305,11 @@ static ngx_int_t ngx_http_proxy_v2_non_buffered_filter(void *data,
     ssize_t bytes);
 static ngx_int_t ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p,
     ngx_buf_t *buf);
-static ngx_int_t ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b);
+static ngx_int_t ngx_http_proxy_v2_process_control_frame(
+    ngx_http_proxy_v2_session_t *sess, ngx_http_proxy_v2_stream_t *stream,
+    ngx_buf_t *b);
+static ngx_int_t ngx_http_proxy_v2_process_closed_frame(
+    ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_skip_frame(ngx_http_proxy_v2_session_t *sess,
     ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
@@ -268,17 +350,54 @@ static ngx_int_t ngx_http_proxy_v2_parse_settings(
 static ngx_int_t ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess,
     ngx_buf_t *b);
 
-static ngx_int_t ngx_http_proxy_v2_send_settings_ack(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx);
-static ngx_int_t ngx_http_proxy_v2_send_ping_ack(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx);
-static ngx_int_t ngx_http_proxy_v2_send_window_update(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx);
+static ngx_int_t ngx_http_proxy_v2_send_settings_ack(
+    ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_send_ping_ack(
+    ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_send_window_update(
+    ngx_http_proxy_v2_session_t *sess, ngx_http_proxy_v2_stream_t *stream);
+static ngx_chain_t *ngx_http_proxy_v2_get_control(
+    ngx_http_proxy_v2_session_t *sess);
+static ngx_uint_t ngx_http_proxy_v2_write_ready(ngx_connection_t *c);
+static ngx_uint_t ngx_http_proxy_v2_output_pending(
+    ngx_http_proxy_v2_session_t *sess);
+static ngx_uint_t ngx_http_proxy_v2_stream_ready(
+    ngx_http_proxy_v2_stream_t *stream);
+static ngx_int_t ngx_http_proxy_v2_send(ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_output_stream(
+    ngx_http_proxy_v2_stream_t *stream);
+static void ngx_http_proxy_v2_output_header(ngx_http_proxy_v2_output_t *out);
+static ngx_int_t ngx_http_proxy_v2_output_file(
+    ngx_http_proxy_v2_session_t *sess, ngx_file_t *file);
+static ngx_int_t ngx_http_proxy_v2_write(ngx_http_proxy_v2_session_t *sess,
+    off_t limit);
+static void ngx_http_proxy_v2_finish_output(
+    ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_free_output(ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_cancel_output(ngx_http_proxy_v2_stream_t *stream);
+static void ngx_http_proxy_v2_stop_output(ngx_http_proxy_v2_stream_t *stream);
+static void ngx_http_proxy_v2_block_reading(ngx_http_request_t *r);
+static void ngx_http_proxy_v2_notify_output(ngx_http_proxy_v2_stream_t *stream);
+static ngx_uint_t ngx_http_proxy_v2_send_expired(
+    ngx_http_proxy_v2_stream_t *stream);
+static void ngx_http_proxy_v2_write_timer(ngx_http_request_t *r);
+static ngx_int_t ngx_http_proxy_v2_check_deadlines(
+    ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_finish_session(ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_discard_input(
+    ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_writer(
+    ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_write_handler(ngx_event_t *ev);
+static void ngx_http_proxy_v2_output_timeout(ngx_event_t *ev);
+static void ngx_http_proxy_v2_control_timeout(ngx_event_t *ev);
+static ngx_int_t ngx_http_proxy_v2_read_idle(ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_idle_read_handler(ngx_event_t *ev);
 
-static ngx_chain_t *ngx_http_proxy_v2_get_buf(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx);
 static void ngx_http_proxy_v2_detach_stream(
     ngx_http_proxy_v2_stream_t *stream);
+static ngx_http_proxy_v2_stream_t *ngx_http_proxy_v2_find_stream(
+    ngx_http_proxy_v2_session_t *session, ngx_uint_t id);
 static ngx_rbtree_key_t ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u);
 static ngx_http_proxy_v2_session_t *
     ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u);
@@ -286,16 +405,21 @@ static ngx_int_t ngx_http_proxy_v2_match_session(
     ngx_http_proxy_v2_session_t *session, ngx_http_upstream_t *u);
 static ngx_int_t ngx_http_proxy_v2_reusable_session(
     ngx_http_proxy_v2_session_t *session);
+static ngx_int_t ngx_http_proxy_v2_retain_session(
+    ngx_http_proxy_v2_session_t *session);
 static ngx_http_proxy_v2_session_t *
-    ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u);
+    ngx_http_proxy_v2_create_session(ngx_http_request_t *r);
+static u_char *ngx_http_proxy_v2_log_error(ngx_log_t *log, u_char *buf,
+    size_t len);
 static void ngx_http_proxy_v2_close_connection(ngx_connection_t *c);
 static void ngx_http_proxy_v2_close_session(ngx_http_proxy_v2_session_t *session);
+static void ngx_http_proxy_v2_release_session(
+    ngx_http_proxy_v2_session_t *session);
 static void ngx_http_proxy_v2_remove_idle(ngx_http_proxy_v2_session_t *session);
 #if (NGX_HTTP_UPSTREAM_KEEPALIVE)
 static void ngx_http_proxy_v2_evict(ngx_connection_t *c);
 #endif
-static void ngx_http_proxy_v2_idle_handler(ngx_event_t *ev);
-static void ngx_http_proxy_v2_dummy_handler(ngx_event_t *ev);
+static void ngx_http_proxy_v2_idle_timeout(ngx_event_t *ev);
 static ngx_int_t ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc,
     void *data);
 static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
@@ -308,6 +432,7 @@ static ngx_int_t ngx_http_proxy_v2_set_session(ngx_peer_connection_t *pc,
     void *data);
 static void ngx_http_proxy_v2_save_session(ngx_peer_connection_t *pc,
     void *data);
+static void ngx_http_proxy_v2_ssl_save_session(ngx_connection_t *c);
 #endif
 
 static void ngx_http_proxy_v2_session_cleanup(void *data);
@@ -353,6 +478,7 @@ ngx_module_t  ngx_http_proxy_v2_module = {
 
 static ngx_rbtree_t       ngx_http_proxy_v2_sessions;
 static ngx_rbtree_node_t  ngx_http_proxy_v2_sessions_sentinel;
+static ngx_queue_t        ngx_http_proxy_v2_sessions_queue;
 
 
 static u_char  ngx_http_proxy_v2_connection_start[] =
@@ -530,8 +656,7 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
         ctx->ctx.head = 1;
     }
 
-    len = sizeof(ngx_http_proxy_v2_connection_start) - 1
-          + sizeof(ngx_http_proxy_v2_frame_t);             /* headers frame */
+    len = sizeof(ngx_http_proxy_v2_frame_t);               /* headers frame */
 
     headers_len = 0;
 
@@ -781,11 +906,6 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
 
     key_tmp = tmp + tmp_len;
     val_tmp = tmp + 2 * tmp_len;
-
-    /* connection preface */
-
-    b->last = ngx_copy(b->last, ngx_http_proxy_v2_connection_start,
-                       sizeof(ngx_http_proxy_v2_connection_start) - 1);
 
     /* headers frame */
 
@@ -1199,11 +1319,8 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
         return NGX_OK;
     }
 
-    ctx->output_blocked = 0;
     ctx->status = 0;
     ctx->stream = NULL;
-    ctx->busy = NULL;
-    ctx->out = NULL;
 
 #if (NGX_HTTP_CACHE)
     if (ctx->cache_header_failed) {
@@ -1297,16 +1414,7 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
 {
     ngx_http_request_t  *r = data;
 
-    off_t                         file_pos;
-    u_char                       *p, *pos, *start;
-    size_t                        len, limit;
-    ngx_buf_t                    *b;
-    ngx_int_t                     rc;
-    ngx_uint_t                    next, last;
-    ngx_chain_t                  *cl, *out, *ln, **ll;
-    ngx_http_upstream_t          *u;
     ngx_http_proxy_v2_ctx_t      *ctx;
-    ngx_http_proxy_v2_frame_t    *f;
     ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *sess;
 
@@ -1322,348 +1430,96 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
     stream = ctx->stream;
     sess = stream->session;
 
+    if (sess->closing) {
+        return stream->done ? NGX_OK : NGX_ERROR;
+    }
+
+    if (stream->output_stopped) {
+        return NGX_OK;
+    }
+
+    if (ngx_http_proxy_v2_send_expired(stream)) {
+        return NGX_AGAIN;
+    }
+
     if (in) {
         if (ngx_chain_add_copy(r->pool, &stream->in, in) != NGX_OK) {
             return NGX_ERROR;
         }
     }
 
-    out = NULL;
-    ll = &out;
-
-    if (!stream->header_sent) {
-        /* first buffer contains headers */
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http proxy output header");
-
-        stream->header_sent = 1;
-
-        b = stream->in->buf;
-        p = b->pos + sizeof(ngx_http_proxy_v2_connection_start) - 1;
-
-        if (stream->id != 1) {
-            /* keepalive connection: skip connection preface */
-
-            b->pos = p;
+    if (stream->in || sess->output.source) {
+        if (!stream->send_waiting) {
+            stream->send_waiting = 1;
+            stream->send_deadline = ngx_current_msec
+                                   + r->upstream->conf->send_timeout;
         }
 
-        /* update stream identifiers, including retries on a new connection */
-
-        while (p < b->last) {
-            f = (ngx_http_proxy_v2_frame_t *) p;
-            p += sizeof(ngx_http_proxy_v2_frame_t);
-
-            f->stream_id_0 = (u_char) ((stream->id >> 24) & 0xff);
-            f->stream_id_1 = (u_char) ((stream->id >> 16) & 0xff);
-            f->stream_id_2 = (u_char) ((stream->id >> 8) & 0xff);
-            f->stream_id_3 = (u_char) (stream->id & 0xff);
-
-            p += (f->length_0 << 16) + (f->length_1 << 8) + f->length_2;
-        }
-
-        if (stream->in->buf->last_buf) {
-            stream->output_closed = 1;
-        }
-
-        *ll = stream->in;
-        ll = &stream->in->next;
-
-        stream->in = stream->in->next;
+        stream->write.ready = 0;
+        ngx_post_event(&sess->write, &ngx_posted_next_events);
+        return NGX_AGAIN;
     }
 
-    if (ctx->out) {
-        /* queued control frames */
+    stream->send_waiting = 0;
+    stream->write.ready = 1;
 
-        *ll = ctx->out;
-
-        for (cl = ctx->out, ll = &cl->next; cl; cl = cl->next) {
-            ll = &cl->next;
-        }
-
-        ctx->out = NULL;
+    if (stream->write.timer_set) {
+        ngx_del_timer(&stream->write);
     }
 
-    f = NULL;
-    last = 0;
-
-    limit = ngx_max(0, stream->send_window);
-
-    if (limit > sess->send_window) {
-        limit = sess->send_window;
-    }
-
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http proxy output limit: %uz w:%z:%uz",
-                   limit, stream->send_window, sess->send_window);
-
-#if (NGX_SUPPRESS_WARN)
-    file_pos = 0;
-    pos = NULL;
-    cl = NULL;
-#endif
-
-    in = stream->in;
-
-    while (in && limit > 0) {
-
-        ngx_log_debug7(NGX_LOG_DEBUG_EVENT, r->connection->log, 0,
-                       "http proxy output in  l:%d f:%d %p, pos %p, size: %z "
-                       "file: %O, size: %O",
-                       in->buf->last_buf,
-                       in->buf->in_file,
-                       in->buf->start, in->buf->pos,
-                       in->buf->last - in->buf->pos,
-                       in->buf->file_pos,
-                       in->buf->file_last - in->buf->file_pos);
-
-        if (ngx_buf_special(in->buf)) {
-            goto next;
-        }
-
-        if (in->buf->in_file) {
-            file_pos = in->buf->file_pos;
-
-        } else {
-            pos = in->buf->pos;
-        }
-
-        next = 0;
-
-        do {
-
-            cl = ngx_http_proxy_v2_get_buf(r, ctx);
-            if (cl == NULL) {
-                return NGX_ERROR;
-            }
-
-            b = cl->buf;
-
-            f = (ngx_http_proxy_v2_frame_t *) b->last;
-            b->last += sizeof(ngx_http_proxy_v2_frame_t);
-
-            *ll = cl;
-            ll = &cl->next;
-
-            cl = ngx_chain_get_free_buf(r->pool, &ctx->free);
-            if (cl == NULL) {
-                return NGX_ERROR;
-            }
-
-            b = cl->buf;
-            start = b->start;
-
-            ngx_memcpy(b, in->buf, sizeof(ngx_buf_t));
-
-            /*
-             * restore b->start to preserve memory allocated in the buffer,
-             * to reuse it later for headers and control frames
-             */
-
-            b->start = start;
-
-            if (in->buf->in_file) {
-                b->file_pos = file_pos;
-                file_pos += ngx_min(NGX_HTTP_V2_DEFAULT_FRAME_SIZE, limit);
-
-                if (file_pos >= in->buf->file_last) {
-                    file_pos = in->buf->file_last;
-                    next = 1;
-                }
-
-                b->file_last = file_pos;
-                len = (ngx_uint_t) (file_pos - b->file_pos);
-
-            } else {
-                b->pos = pos;
-                pos += ngx_min(NGX_HTTP_V2_DEFAULT_FRAME_SIZE, limit);
-
-                if (pos >= in->buf->last) {
-                    pos = in->buf->last;
-                    next = 1;
-                }
-
-                b->last = pos;
-                len = (ngx_uint_t) (pos - b->pos);
-            }
-
-            b->tag = (ngx_buf_tag_t) &ngx_http_proxy_v2_body_output_filter;
-            b->shadow = in->buf;
-            b->last_shadow = next;
-
-            b->last_buf = 0;
-            b->last_in_chain = 0;
-
-            *ll = cl;
-            ll = &cl->next;
-
-            f->length_0 = (u_char) ((len >> 16) & 0xff);
-            f->length_1 = (u_char) ((len >> 8) & 0xff);
-            f->length_2 = (u_char) (len & 0xff);
-            f->type = NGX_HTTP_V2_DATA_FRAME;
-            f->flags = 0;
-            f->stream_id_0 = (u_char) ((stream->id >> 24) & 0xff);
-            f->stream_id_1 = (u_char) ((stream->id >> 16) & 0xff);
-            f->stream_id_2 = (u_char) ((stream->id >> 8) & 0xff);
-            f->stream_id_3 = (u_char) (stream->id & 0xff);
-
-            limit -= len;
-            stream->send_window -= len;
-            sess->send_window -= len;
-
-        } while (!next && limit > 0);
-
-        if (!next) {
-            /*
-             * if the buffer wasn't fully sent due to flow control limits,
-             * preserve position for future use
-             */
-
-            if (in->buf->in_file) {
-                in->buf->file_pos = file_pos;
-
-            } else {
-                in->buf->pos = pos;
-            }
-
-            break;
-        }
-
-    next:
-
-        if (in->buf->last_buf) {
-            last = 1;
-        }
-
-        ln = in;
-        in = in->next;
-
-        ngx_free_chain(r->pool, ln);
-    }
-
-    stream->in = in;
-
-    if (last) {
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http proxy output last");
-
-        stream->output_closed = 1;
-
-        if (f) {
-            f->flags |= NGX_HTTP_V2_END_STREAM_FLAG;
-
-        } else {
-            cl = ngx_http_proxy_v2_get_buf(r, ctx);
-            if (cl == NULL) {
-                return NGX_ERROR;
-            }
-
-            b = cl->buf;
-
-            f = (ngx_http_proxy_v2_frame_t *) b->last;
-            b->last += sizeof(ngx_http_proxy_v2_frame_t);
-
-            f->length_0 = 0;
-            f->length_1 = 0;
-            f->length_2 = 0;
-            f->type = NGX_HTTP_V2_DATA_FRAME;
-            f->flags = NGX_HTTP_V2_END_STREAM_FLAG;
-            f->stream_id_0 = (u_char) ((stream->id >> 24) & 0xff);
-            f->stream_id_1 = (u_char) ((stream->id >> 16) & 0xff);
-            f->stream_id_2 = (u_char) ((stream->id >> 8) & 0xff);
-            f->stream_id_3 = (u_char) (stream->id & 0xff);
-
-            *ll = cl;
-            ll = &cl->next;
-        }
-
-        cl->buf->last_buf = 1;
-    }
-
-    *ll = NULL;
-
-#if (NGX_DEBUG)
-
-    for (cl = out; cl; cl = cl->next) {
-        ngx_log_debug7(NGX_LOG_DEBUG_EVENT, r->connection->log, 0,
-                       "http proxy output out l:%d f:%d %p, pos %p, size: %z "
-                       "file: %O, size: %O",
-                       cl->buf->last_buf,
-                       cl->buf->in_file,
-                       cl->buf->start, cl->buf->pos,
-                       cl->buf->last - cl->buf->pos,
-                       cl->buf->file_pos,
-                       cl->buf->file_last - cl->buf->file_pos);
-    }
-
-    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http proxy output limit: %uz w:%z:%uz",
-                   limit, stream->send_window, sess->send_window);
-
-#endif
-
-    rc = ngx_chain_writer(&r->upstream->writer, out);
-
-    ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &out,
-                         (ngx_buf_tag_t) &ngx_http_proxy_v2_body_output_filter);
-
-    for (cl = ctx->free; cl; cl = cl->next) {
-
-        /* mark original buffers as sent */
-
-        if (cl->buf->shadow) {
-            if (cl->buf->last_shadow) {
-                b = cl->buf->shadow;
-                b->pos = b->last;
-            }
-
-            cl->buf->shadow = NULL;
-        }
-    }
-
-    if (rc == NGX_OK && stream->in) {
-        rc = NGX_AGAIN;
-    }
-
-    if (rc == NGX_AGAIN) {
-        ctx->output_blocked = 1;
-
-    } else {
-        ctx->output_blocked = 0;
-    }
-
-    if (stream->done) {
-
-        /*
-         * We have already got the response and were sending some additional
-         * control frames.  Even if there is still something unsent, stop
-         * here anyway.
-         */
-
-        u = r->upstream;
-        u->length = 0;
-        u->pipe->length = 0;
-
-        if (stream->in == NULL
-            && ctx->out == NULL
-            && stream->output_closed
-            && !ctx->output_blocked
-            && !sess->goaway
-            && sess->state == ngx_http_proxy_v2_st_start)
-        {
-            u->keepalive = 1;
-        }
-
-        ngx_post_event(u->peer.connection->read, &ngx_posted_events);
-    }
-
-    return rc;
+    return NGX_OK;
 }
 
 
 static ngx_int_t
 ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
+{
+    ssize_t               n;
+    ngx_int_t             rc;
+    ngx_buf_t            *b;
+    ngx_connection_t     *c;
+    ngx_http_upstream_t  *u;
+
+#if (NGX_HTTP_CACHE)
+    if (r->cached) {
+        return ngx_http_proxy_process_cache_header(r);
+    }
+#endif
+
+    u = r->upstream;
+    c = u->connection;
+    b = &u->buffer;
+
+    for ( ;; ) {
+        rc = ngx_http_proxy_v2_process_headers(r);
+        if (rc != NGX_AGAIN) {
+            return rc;
+        }
+
+        if (b->last == b->end) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "upstream sent too big header");
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
+        n = c->recv(c, b->last, b->end - b->last);
+        if (n == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        if (n <= 0) {
+            return NGX_HTTP_UPSTREAM_CONNECTION_ERROR;
+        }
+
+        b->last += n;
+        u->state->bytes_received += n;
+        u->response_received = 1;
+    }
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_process_headers(ngx_http_request_t *r)
 {
     u_char                         *p, *pos;
     size_t                          size;
@@ -1677,12 +1533,6 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
     ngx_http_upstream_header_t     *hh;
     ngx_http_proxy_v2_session_t    *sess;
     ngx_http_upstream_main_conf_t  *umcf;
-
-#if (NGX_HTTP_CACHE)
-    if (r->cached) {
-        return ngx_http_proxy_process_cache_header(r);
-    }
-#endif
 
     u = r->upstream;
     b = &u->buffer;
@@ -1716,7 +1566,7 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
 
             /* Retain an incomplete initial frame header in the buffer. */
 
-            if (!sess->header_stream_id
+            if ((!sess->header_stream_id || sess->header_discard)
                 && b->last - b->pos < NGX_HTTP_V2_FRAME_HEADER_SIZE)
             {
                 goto again;
@@ -1735,21 +1585,18 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
 
             /* DATA frames cannot appear before the response headers. */
 
-            if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
+            if (sess->type == NGX_HTTP_V2_DATA_FRAME
+                && sess->stream_id == stream->id)
+            {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                               "upstream sent unexpected http2 frame: %d",
                               sess->type);
                 return NGX_HTTP_UPSTREAM_INVALID_HEADER;
             }
 
-            if (sess->stream_id && sess->stream_id != stream->id) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for unknown stream %ui",
-                              sess->stream_id);
-                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-            }
-
-            if (sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
+            if (sess->type == NGX_HTTP_V2_HEADERS_FRAME
+                && sess->stream_id == stream->id)
+            {
                 /* Reclaim controls preceding headers in the same read. */
 
                 size = b->pos - p;
@@ -1759,6 +1606,20 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
         }
 
         /* frame payload */
+
+        if (sess->stream_id && sess->stream_id != stream->id) {
+            rc = ngx_http_proxy_v2_process_closed_frame(sess, b);
+
+            if (rc == NGX_OK) {
+                continue;
+            }
+
+            if (rc == NGX_AGAIN) {
+                goto again;
+            }
+
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
 
         if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
             rc = ngx_http_proxy_v2_parse_rst_stream(sess, b);
@@ -1781,7 +1642,7 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
             return NGX_HTTP_UPSTREAM_INVALID_HEADER;
         }
 
-        rc = ngx_http_proxy_v2_process_control_frame(r, ctx, b);
+        rc = ngx_http_proxy_v2_process_control_frame(sess, stream, b);
 
         if (rc == NGX_AGAIN) {
             goto again;
@@ -1959,14 +1820,13 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
                     }
 
                     ctx->status = 0;
+                    u->headers_in.header_size = b->pos - pos;
                     return NGX_HTTP_UPSTREAM_EARLY_HINTS;
                 }
 
                 if (stream->input_closed
                     && stream->in == NULL
-                    && ctx->out == NULL
                     && stream->output_closed
-                    && !ctx->output_blocked
                     && !sess->goaway
                     && b->last == b->pos)
                 {
@@ -2004,7 +1864,7 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
 
 again:
 
-    if (!sess->header_stream_id) {
+    if (!sess->header_stream_id || sess->header_discard) {
         /* Retain only undecoded frame-header bytes before the response. */
 
         b->last = ngx_movemem(pos, b->pos, b->last - b->pos);
@@ -2248,6 +2108,7 @@ ngx_http_proxy_v2_finish_response(ngx_http_request_t *r,
     }
 
     stream->done = 1;
+    ngx_http_proxy_v2_stop_output(stream);
 
     return NGX_OK;
 }
@@ -2274,26 +2135,13 @@ ngx_http_proxy_v2_process_body(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    if (rc == NGX_AGAIN) {
-        return NGX_AGAIN;
-    }
-
-    /*
-     * We have finished parsing the response and the remaining control
-     * frames.  If there are unsent control frames, post a write event
-     * to send them.
-     */
-
-    if (ctx->out) {
-        ngx_post_event(r->upstream->peer.connection->write, &ngx_posted_events);
+    if (rc == NGX_AGAIN && !stream->done) {
         return NGX_AGAIN;
     }
 
     if (stream->in == NULL
         && stream->output_closed
-        && !ctx->output_blocked
-        && !sess->goaway
-        && sess->state == ngx_http_proxy_v2_st_start)
+        && !sess->goaway)
     {
         r->upstream->keepalive = 1;
     }
@@ -2529,20 +2377,14 @@ ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p, ngx_buf_t *b)
 
 
 static ngx_int_t
-ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b)
+ngx_http_proxy_v2_process_control_frame(ngx_http_proxy_v2_session_t *sess,
+    ngx_http_proxy_v2_stream_t *stream, ngx_buf_t *b)
 {
-    ssize_t                       window_update;
-    ngx_int_t                     rc;
-    ngx_rbtree_t                 *tree;
-    ngx_rbtree_node_t            *node;
-    ngx_http_upstream_t          *u;
-    ngx_http_proxy_v2_stream_t   *stream;
-    ngx_http_proxy_v2_session_t  *sess;
-
-    u = r->upstream;
-    stream = ctx->stream;
-    sess = stream->session;
+    ssize_t                      window_update;
+    ngx_int_t                    rc;
+    ngx_rbtree_t                *tree;
+    ngx_rbtree_node_t           *node;
+    ngx_http_proxy_v2_stream_t  *s;
 
     if (sess->type == NGX_HTTP_V2_GOAWAY_FRAME) {
 
@@ -2567,7 +2409,12 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
         }
 
         sess->goaway = 1;
-        u->keepalive = 0;
+
+        if (stream == NULL) {
+            return NGX_OK;
+        }
+
+        stream->request->upstream->keepalive = 0;
 
         /*
          * Streams above the confirmed last stream ID need to be retried.
@@ -2578,7 +2425,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
         if (sess->goaway_last_stream_id < stream->id) {
 
             if (sess->goaway_error || stream->response_received) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent goaway with error %ui",
                               sess->goaway_error);
             }
@@ -2606,7 +2453,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
         }
 
         if (sess->window_update == 0) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent zero window update");
             return NGX_ERROR;
         }
@@ -2616,7 +2463,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             if (sess->window_update > (size_t) NGX_HTTP_V2_MAX_WINDOW
                                       - stream->send_window)
             {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent too large window update");
                 return NGX_ERROR;
             }
@@ -2628,7 +2475,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             if (sess->window_update > NGX_HTTP_V2_MAX_WINDOW
                                       - sess->send_window)
             {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent too large window update");
                 return NGX_ERROR;
             }
@@ -2636,9 +2483,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             sess->send_window += sess->window_update;
         }
 
-        if (stream->in) {
-            ngx_post_event(u->peer.connection->write, &ngx_posted_events);
-        }
+        ngx_post_event(&sess->write, &ngx_posted_next_events);
 
         return NGX_OK;
     }
@@ -2651,7 +2496,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             rc = ngx_http_proxy_v2_parse_settings(sess, b);
 
             if (rc == NGX_AGAIN) {
-                return NGX_AGAIN;
+                break;
             }
 
             if (rc == NGX_ERROR) {
@@ -2664,6 +2509,12 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
 
             /* consume each setting before the parser reuses its result */
 
+            if (sess->setting_id == 0x03) {
+                /* SETTINGS_MAX_CONCURRENT_STREAMS, including zero */
+
+                sess->max_streams = sess->setting_value;
+            }
+
             if (sess->setting_id == 0x04) {
                 /* SETTINGS_INITIAL_WINDOW_SIZE */
 
@@ -2675,22 +2526,21 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
                          node;
                          node = ngx_rbtree_next(tree, node))
                     {
-                        stream = ngx_rbtree_data(node,
-                                                ngx_http_proxy_v2_stream_t,
-                                                node);
+                        s = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t,
+                                            node);
 
-                        if (stream->send_window > 0
+                        if (s->send_window > 0
                             && window_update > (ssize_t) NGX_HTTP_V2_MAX_WINDOW
-                                               - stream->send_window)
+                                               - s->send_window)
                         {
-                            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                                           "upstream sent settings frame "
                                           "with too large initial window "
                                           "size: %ui", sess->setting_value);
                             return NGX_ERROR;
                         }
 
-                        stream->send_window += window_update;
+                        s->send_window += window_update;
                     }
                 }
 
@@ -2698,15 +2548,17 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             }
         }
 
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
         if (!(sess->flags & NGX_HTTP_V2_ACK_FLAG)) {
-            if (ngx_http_proxy_v2_send_settings_ack(r, ctx) != NGX_OK) {
+            if (ngx_http_proxy_v2_send_settings_ack(sess) != NGX_OK) {
                 return NGX_ERROR;
             }
         }
 
-        if (ctx->out || ctx->stream->in) {
-            ngx_post_event(u->peer.connection->write, &ngx_posted_events);
-        }
+        ngx_post_event(&sess->write, &ngx_posted_next_events);
 
         return NGX_OK;
     }
@@ -2723,22 +2575,98 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             return NGX_ERROR;
         }
 
-        if (ngx_http_proxy_v2_send_ping_ack(r, ctx) != NGX_OK) {
+        if (ngx_http_proxy_v2_send_ping_ack(sess) != NGX_OK) {
             return NGX_ERROR;
         }
-
-        ngx_post_event(u->peer.connection->write, &ngx_posted_events);
 
         return NGX_OK;
     }
 
     if (sess->type == NGX_HTTP_V2_PUSH_PROMISE_FRAME) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                       "upstream sent unexpected push promise frame");
         return NGX_ERROR;
     }
 
     return NGX_DECLINED;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_process_closed_frame(ngx_http_proxy_v2_session_t *sess,
+    ngx_buf_t *b)
+{
+    size_t     size;
+    ngx_int_t  rc;
+
+    switch (sess->type) {
+
+    case NGX_HTTP_V2_DATA_FRAME:
+
+        if (sess->frame_state == 0) {
+            if (sess->rest > sess->recv_window) {
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
+                              "upstream violated connection flow control");
+                return NGX_ERROR;
+            }
+
+            sess->recv_window -= sess->rest;
+            sess->frame_state = 1;
+            sess->padding = 0;
+        }
+
+        for ( ;; ) {
+            rc = ngx_http_proxy_v2_parse_data(sess, b, &size);
+
+            if (rc != NGX_OK) {
+                break;
+            }
+
+            if (ngx_http_proxy_v2_process_data(sess, b, size) != NGX_OK) {
+                return NGX_ERROR;
+            }
+        }
+
+        if (rc != NGX_DONE) {
+            return rc;
+        }
+
+        if (sess->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4) {
+            return ngx_http_proxy_v2_send_window_update(sess, NULL);
+        }
+
+        return NGX_OK;
+
+    case NGX_HTTP_V2_HEADERS_FRAME:
+    case NGX_HTTP_V2_CONTINUATION_FRAME:
+
+        if (sess->frame_state == 0 && sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
+            sess->header_limit = sess->conf->buffer_size;
+            sess->header_discard = 1;
+            ngx_http_proxy_v2_clear_header(sess);
+        }
+
+        rc = ngx_http_proxy_v2_parse_header(sess, b);
+
+        if (rc == NGX_HTTP_PARSE_HEADER_DONE
+            || (rc == NGX_AGAIN && sess->state == ngx_http_proxy_v2_st_start))
+        {
+            return NGX_OK;
+        }
+
+        return rc;
+
+    case NGX_HTTP_V2_RST_STREAM_FRAME:
+        return ngx_http_proxy_v2_parse_rst_stream(sess, b);
+
+    case NGX_HTTP_V2_WINDOW_UPDATE_FRAME:
+        return ngx_http_proxy_v2_parse_window_update(sess, b);
+
+    case NGX_HTTP_V2_PUSH_PROMISE_FRAME:
+        return NGX_ERROR;
+    }
+
+    return ngx_http_proxy_v2_skip_frame(sess, b);
 }
 
 
@@ -2787,15 +2715,9 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                 return NGX_ERROR;
             }
 
-            if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
-
-                if (sess->stream_id != stream->id) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                  "upstream sent data frame "
-                                  "for unknown stream %ui",
-                                  sess->stream_id);
-                    return NGX_ERROR;
-                }
+            if (sess->type == NGX_HTTP_V2_DATA_FRAME
+                && sess->stream_id == stream->id)
+            {
 
                 if (sess->rest > stream->recv_window) {
                     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -2819,25 +2741,15 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                 if (sess->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4
                     || stream->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4)
                 {
-                    if (ngx_http_proxy_v2_send_window_update(r, ctx)
+                    if (ngx_http_proxy_v2_send_window_update(sess, stream)
                         != NGX_OK)
                     {
                         return NGX_ERROR;
                     }
-
-                    ngx_post_event(u->peer.connection->write,
-                                   &ngx_posted_events);
                 }
             }
 
-            if (sess->stream_id && sess->stream_id != stream->id) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for unknown stream %ui",
-                              sess->stream_id);
-                return NGX_ERROR;
-            }
-
-            if (sess->stream_id && stream->input_closed
+            if (sess->stream_id == stream->id && stream->input_closed
                 && sess->type != NGX_HTTP_V2_RST_STREAM_FRAME
                 && sess->type != NGX_HTTP_V2_WINDOW_UPDATE_FRAME)
             {
@@ -2851,6 +2763,16 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
         }
 
         /* frame payload */
+
+        if (sess->stream_id && sess->stream_id != stream->id) {
+            rc = ngx_http_proxy_v2_process_closed_frame(sess, b);
+
+            if (rc == NGX_OK) {
+                continue;
+            }
+
+            return rc;
+        }
 
         if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
 
@@ -2884,7 +2806,7 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
             continue;
         }
 
-        rc = ngx_http_proxy_v2_process_control_frame(r, ctx, b);
+        rc = ngx_http_proxy_v2_process_control_frame(sess, stream, b);
 
         if (rc == NGX_AGAIN) {
             return NGX_AGAIN;
@@ -3049,7 +2971,7 @@ ngx_http_proxy_v2_parse_data(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b,
         if (sess->flags & NGX_HTTP_V2_PADDED_FLAG) {
 
             if (sess->rest == 0) {
-                ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent too short http2 frame");
                 return NGX_ERROR;
             }
@@ -3063,7 +2985,7 @@ ngx_http_proxy_v2_parse_data(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b,
             sess->rest -= 1;
 
             if (sess->padding > sess->rest) {
-                ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent http2 frame with too long "
                               "padding: %d in frame %uz",
                               sess->padding, sess->rest);
@@ -3111,7 +3033,7 @@ ngx_http_proxy_v2_process_data(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b,
         || size > sess->rest - sess->padding
         || size > (size_t) (b->last - b->pos))
     {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                       "invalid http2 data consumption: %uz", size);
         return NGX_ERROR;
     }
@@ -3135,7 +3057,7 @@ ngx_http_proxy_v2_parse_frame(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         ch = *p;
 
 #if 0
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                        "http proxy frame byte: %02Xd, s:%d", ch, state);
 #endif
 
@@ -3155,7 +3077,7 @@ ngx_http_proxy_v2_parse_frame(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
             sess->rest |= ch;
 
             if (sess->rest > NGX_HTTP_V2_DEFAULT_FRAME_SIZE) {
-                ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                               "upstream sent too large http2 frame: %uz",
                               sess->rest);
                 return NGX_ERROR;
@@ -3192,7 +3114,7 @@ ngx_http_proxy_v2_parse_frame(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         case ngx_http_proxy_v2_st_stream_id_4:
             sess->stream_id |= ch;
 
-            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                            "http proxy frame: %d, len: %uz, f:%d, i:%ui",
                            sess->type, sess->rest, sess->flags,
                            sess->stream_id);
@@ -3228,7 +3150,7 @@ ngx_http_proxy_v2_validate_frame(ngx_http_proxy_v2_session_t *sess)
         || (sess->type != NGX_HTTP_V2_CONTINUATION_FRAME
             && sess->header_stream_id))
     {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                       "upstream sent unexpected http2 frame: %d", sess->type);
         return NGX_ERROR;
     }
@@ -3236,7 +3158,7 @@ ngx_http_proxy_v2_validate_frame(ngx_http_proxy_v2_session_t *sess)
     if (sess->type == NGX_HTTP_V2_CONTINUATION_FRAME
         && sess->stream_id != sess->header_stream_id)
     {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                       "upstream sent continuation frame "
                       "for wrong stream %ui, expected %ui",
                       sess->stream_id, sess->header_stream_id);
@@ -3252,8 +3174,21 @@ ngx_http_proxy_v2_validate_frame(ngx_http_proxy_v2_session_t *sess)
     case NGX_HTTP_V2_CONTINUATION_FRAME:
 
         if (sess->stream_id == 0) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent http2 frame %d with zero stream id",
+                          sess->type);
+            return NGX_ERROR;
+        }
+
+        break;
+
+    case NGX_HTTP_V2_SETTINGS_FRAME:
+    case NGX_HTTP_V2_PING_FRAME:
+    case NGX_HTTP_V2_GOAWAY_FRAME:
+
+        if (sess->stream_id) {
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
+                          "upstream sent http2 frame %d with nonzero stream id",
                           sess->type);
             return NGX_ERROR;
         }
@@ -3262,10 +3197,29 @@ ngx_http_proxy_v2_validate_frame(ngx_http_proxy_v2_session_t *sess)
     }
 
     if (sess->type == NGX_HTTP_V2_PRIORITY_FRAME && sess->rest != 5) {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                       "upstream sent priority frame with invalid length: %uz",
                       sess->rest);
         return NGX_ERROR;
+    }
+
+    switch (sess->type) {
+
+    case NGX_HTTP_V2_DATA_FRAME:
+    case NGX_HTTP_V2_HEADERS_FRAME:
+    case NGX_HTTP_V2_RST_STREAM_FRAME:
+    case NGX_HTTP_V2_CONTINUATION_FRAME:
+    case NGX_HTTP_V2_WINDOW_UPDATE_FRAME:
+
+        if (sess->stream_id
+            && (!(sess->stream_id & 1)
+                || sess->stream_id > sess->last_opened_id))
+        {
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
+                          "upstream sent frame for unknown stream %ui",
+                          sess->stream_id);
+            return NGX_ERROR;
+        }
     }
 
     return NGX_OK;
@@ -3343,7 +3297,7 @@ ngx_http_proxy_v2_parse_header(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         sw_padding
     } state;
 
-    log = sess->connection->log;
+    log = &sess->log;
     state = sess->frame_state;
 
     if (state == sw_start) {
@@ -3603,7 +3557,7 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_session_t *sess,
         sw_value_bytes
     } state;
 
-    log = sess->connection->log;
+    log = &sess->log;
 
     /* header block fragment */
 
@@ -4130,10 +4084,10 @@ ngx_http_proxy_v2_parse_field(ngx_http_proxy_v2_session_t *sess,
 
         if (ngx_http_huff_decode(&sess->field_state, p, n, &dst,
                                 sess->field_rest == 0 && n == size,
-                                sess->connection->log)
+                                &sess->log)
             != NGX_OK)
         {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent invalid encoded header");
             return NGX_ERROR;
         }
@@ -4270,7 +4224,7 @@ ngx_http_proxy_v2_parse_rst_stream(ngx_http_proxy_v2_session_t *sess,
 
     if (state == sw_start) {
         if (sess->rest != 4) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent rst stream frame "
                           "with invalid length: %uz",
                           sess->rest);
@@ -4282,7 +4236,7 @@ ngx_http_proxy_v2_parse_rst_stream(ngx_http_proxy_v2_session_t *sess,
         ch = *p;
 
 #if 0
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                        "http proxy rst byte: %02Xd s:%d", ch, state);
 #endif
 
@@ -4307,7 +4261,7 @@ ngx_http_proxy_v2_parse_rst_stream(ngx_http_proxy_v2_session_t *sess,
             sess->error |= ch;
             state = sw_start;
 
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                            "http proxy error: %ui", sess->error);
 
             break;
@@ -4356,7 +4310,7 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
     if (state == sw_start) {
 
         if (sess->stream_id) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent goaway frame "
                           "with non-zero stream id: %ui",
                           sess->stream_id);
@@ -4364,7 +4318,7 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         }
 
         if (sess->rest < 8) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent goaway frame "
                           "with invalid length: %uz",
                           sess->rest);
@@ -4376,7 +4330,7 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         ch = *p;
 
 #if 0
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                        "http proxy goaway byte: %02Xd s:%d", ch, state);
 #endif
 
@@ -4435,7 +4389,7 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         return NGX_AGAIN;
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                    "http proxy goaway: %ui, stream %ui",
                    sess->error, sess->frame_goaway_last_stream_id);
 
@@ -4468,7 +4422,7 @@ ngx_http_proxy_v2_parse_window_update(ngx_http_proxy_v2_session_t *sess,
 
     if (state == sw_start) {
         if (sess->rest != 4) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent window update frame "
                           "with invalid length: %uz",
                           sess->rest);
@@ -4480,7 +4434,7 @@ ngx_http_proxy_v2_parse_window_update(ngx_http_proxy_v2_session_t *sess,
         ch = *p;
 
 #if 0
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                        "http proxy window update byte: %02Xd s:%d", ch, state);
 #endif
 
@@ -4518,7 +4472,7 @@ ngx_http_proxy_v2_parse_window_update(ngx_http_proxy_v2_session_t *sess,
 
     sess->state = ngx_http_proxy_v2_st_start;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                    "http proxy window update: %ui", sess->window_update);
 
     return NGX_OK;
@@ -4541,7 +4495,7 @@ ngx_http_proxy_v2_parse_settings(ngx_http_proxy_v2_session_t *sess,
         sw_value_4
     } state;
 
-    log = sess->connection->log;
+    log = &sess->log;
 
     if (b->last - b->pos < (ssize_t) sess->rest) {
         last = b->last;
@@ -4693,7 +4647,7 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
     if (state == sw_start) {
 
         if (sess->stream_id) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent ping frame "
                           "with non-zero stream id: %ui",
                           sess->stream_id);
@@ -4701,7 +4655,7 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         }
 
         if (sess->rest != 8) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent ping frame "
                           "with invalid length: %uz",
                           sess->rest);
@@ -4709,7 +4663,7 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         }
 
         if (sess->flags & NGX_HTTP_V2_ACK_FLAG) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
                           "upstream sent ping frame with ack flag");
             return NGX_ERROR;
         }
@@ -4719,7 +4673,7 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         ch = *p;
 
 #if 0
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                        "http proxy ping byte: %02Xd s:%d", ch, state);
 #endif
 
@@ -4731,7 +4685,7 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
             sess->ping_data[7] = ch;
             state = sw_start;
 
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                            "http proxy ping");
         }
     }
@@ -4751,26 +4705,15 @@ ngx_http_proxy_v2_parse_ping(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
 
 
 static ngx_int_t
-ngx_http_proxy_v2_send_settings_ack(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_send_settings_ack(ngx_http_proxy_v2_session_t *sess)
 {
-    ngx_chain_t                *cl, **ll;
+    ngx_chain_t                *cl;
     ngx_http_proxy_v2_frame_t  *f;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                    "http proxy send settings ack");
 
-    if (ctx->free == NULL && ctx->settings++ > 1000) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "upstream sent too many settings frames");
-        return NGX_ERROR;
-    }
-
-    for (cl = ctx->out, ll = &ctx->out; cl; cl = cl->next) {
-        ll = &cl->next;
-    }
-
-    cl = ngx_http_proxy_v2_get_buf(r, ctx);
+    cl = ngx_http_proxy_v2_get_control(sess);
     if (cl == NULL) {
         return NGX_ERROR;
     }
@@ -4788,36 +4731,20 @@ ngx_http_proxy_v2_send_settings_ack(ngx_http_request_t *r,
     f->stream_id_2 = 0;
     f->stream_id_3 = 0;
 
-    *ll = cl;
-
     return NGX_OK;
 }
 
 
 static ngx_int_t
-ngx_http_proxy_v2_send_ping_ack(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_send_ping_ack(ngx_http_proxy_v2_session_t *sess)
 {
-    ngx_chain_t                  *cl, **ll;
-    ngx_http_proxy_v2_frame_t    *f;
-    ngx_http_proxy_v2_session_t  *sess;
+    ngx_chain_t                *cl;
+    ngx_http_proxy_v2_frame_t  *f;
 
-    sess = ctx->stream->session;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                    "http proxy send ping ack");
 
-    if (ctx->free == NULL && ctx->pings++ > 1000) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "upstream sent too many ping frames");
-        return NGX_ERROR;
-    }
-
-    for (cl = ctx->out, ll = &ctx->out; cl; cl = cl->next) {
-        ll = &cl->next;
-    }
-
-    cl = ngx_http_proxy_v2_get_buf(r, ctx);
+    cl = ngx_http_proxy_v2_get_control(sess);
     if (cl == NULL) {
         return NGX_ERROR;
     }
@@ -4837,34 +4764,23 @@ ngx_http_proxy_v2_send_ping_ack(ngx_http_request_t *r,
 
     cl->buf->last = ngx_copy(cl->buf->last, sess->ping_data, 8);
 
-    *ll = cl;
-
     return NGX_OK;
 }
 
 
 static ngx_int_t
-ngx_http_proxy_v2_send_window_update(ngx_http_request_t *r,
-    ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
+    ngx_http_proxy_v2_stream_t *stream)
 {
-    size_t                        n;
-    ngx_chain_t                  *cl, **ll;
-    ngx_http_proxy_v2_frame_t    *f;
-    ngx_http_proxy_v2_stream_t   *stream;
-    ngx_http_proxy_v2_session_t  *sess;
+    size_t                     n;
+    ngx_chain_t               *cl;
+    ngx_http_proxy_v2_frame_t  *f;
 
-    stream = ctx->stream;
-    sess = stream->session;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, &sess->log, 0,
                    "http proxy send window update: %uz %uz",
-                   sess->recv_window, stream->recv_window);
+                   sess->recv_window, stream ? stream->recv_window : 0);
 
-    for (cl = ctx->out, ll = &ctx->out; cl; cl = cl->next) {
-        ll = &cl->next;
-    }
-
-    cl = ngx_http_proxy_v2_get_buf(r, ctx);
+    cl = ngx_http_proxy_v2_get_control(sess);
     if (cl == NULL) {
         return NGX_ERROR;
     }
@@ -4890,6 +4806,15 @@ ngx_http_proxy_v2_send_window_update(ngx_http_request_t *r,
     *cl->buf->last++ = (u_char) ((n >> 8) & 0xff);
     *cl->buf->last++ = (u_char) (n & 0xff);
 
+    if (stream == NULL) {
+        return NGX_OK;
+    }
+
+    cl = ngx_http_proxy_v2_get_control(sess);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
     f = (ngx_http_proxy_v2_frame_t *) cl->buf->last;
     cl->buf->last += sizeof(ngx_http_proxy_v2_frame_t);
 
@@ -4911,53 +4836,1182 @@ ngx_http_proxy_v2_send_window_update(ngx_http_request_t *r,
     *cl->buf->last++ = (u_char) ((n >> 8) & 0xff);
     *cl->buf->last++ = (u_char) (n & 0xff);
 
-    *ll = cl;
-
     return NGX_OK;
 }
 
 
 static ngx_chain_t *
-ngx_http_proxy_v2_get_buf(ngx_http_request_t *r, ngx_http_proxy_v2_ctx_t *ctx)
+ngx_http_proxy_v2_get_control(ngx_http_proxy_v2_session_t *sess)
 {
-    u_char       *start;
     ngx_buf_t    *b;
     ngx_chain_t  *cl;
 
-    cl = ngx_chain_get_free_buf(r->pool, &ctx->free);
-    if (cl == NULL) {
+    if (sess->closing) {
         return NULL;
     }
 
-    b = cl->buf;
-    start = b->start;
+    cl = sess->control_free;
 
-    if (start == NULL) {
+    if (cl) {
+        sess->control_free = cl->next;
 
-        /*
-         * each buffer is large enough to hold two window update
-         * frames in a row
-         */
-
-        start = ngx_palloc(r->pool, 2 * sizeof(ngx_http_proxy_v2_frame_t) + 8);
-        if (start == NULL) {
+    } else {
+        if (sess->controls == NGX_HTTP_PROXY_V2_MAX_CONTROL) {
+            ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
+                          "upstream sent too many http2 control frames");
             return NULL;
         }
 
+        b = ngx_create_temp_buf(sess->pool,
+                               sizeof(ngx_http_proxy_v2_frame_t) + 8);
+        if (b == NULL) {
+            return NULL;
+        }
+
+        cl = ngx_alloc_chain_link(sess->pool);
+        if (cl == NULL) {
+            return NULL;
+        }
+
+        cl->buf = b;
+        sess->controls++;
     }
 
-    ngx_memzero(b, sizeof(ngx_buf_t));
+    cl->buf->tag = (ngx_buf_tag_t) &ngx_http_proxy_v2_get_control;
+    cl->buf->flush = 1;
+    cl->next = NULL;
+    *sess->control_last = cl;
+    sess->control_last = &cl->next;
+    sess->pending_controls++;
 
-    b->start = start;
-    b->pos = start;
-    b->last = start;
-    b->end = start + 2 * sizeof(ngx_http_proxy_v2_frame_t) + 8;
+    if (!sess->control_timer.timer_set) {
+        sess->control_deadline = ngx_current_msec + sess->conf->send_timeout;
+        ngx_add_timer(&sess->control_timer, sess->conf->send_timeout);
+    }
 
-    b->tag = (ngx_buf_tag_t) &ngx_http_proxy_v2_body_output_filter;
-    b->temporary = 1;
-    b->flush = 1;
+    ngx_post_event(&sess->write, &ngx_posted_next_events);
 
     return cl;
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_write_ready(ngx_connection_t *c)
+{
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_write_handler) {
+        return 0;
+    }
+
+    if (c->ssl && c->ssl->saved_read_handler) {
+        return c->read->ready;
+    }
+#endif
+
+    return c->write->ready;
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_output_pending(ngx_http_proxy_v2_session_t *sess)
+{
+    return !sess->preface_sent || sess->control
+           || sess->output.kind != ngx_http_proxy_v2_output_none
+           || sess->connection->buffered;
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_stream_ready(ngx_http_proxy_v2_stream_t *stream)
+{
+    if (stream == NULL || stream->in == NULL || stream->rst
+        || stream->connection.error || stream->output_stopped
+        || stream->send_expired)
+    {
+        return 0;
+    }
+
+    if (!stream->header_sent) {
+        return stream->header_started
+               || (!stream->session->goaway && stream->session->max_streams);
+    }
+
+    return ngx_buf_size(stream->in->buf) <= 0
+           || (stream->send_window > 0 && stream->session->send_window > 0);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_send(ngx_http_proxy_v2_session_t *sess)
+{
+    off_t                        sent, left;
+    ngx_int_t                    rc;
+    ngx_uint_t                   budget;
+    ngx_chain_t                 *cl;
+    ngx_connection_t            *c;
+    ngx_http_proxy_v2_output_t  *out;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    c = sess->connection;
+    out = &sess->output;
+    stream = ngx_http_proxy_v2_find_stream(sess, sess->last_stream_id);
+
+    if (ngx_http_proxy_v2_check_deadlines(sess) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (stream && !stream->output_stopped
+        && ngx_http_proxy_v2_send_expired(stream))
+    {
+        return NGX_AGAIN;
+    }
+
+    if (out->source && !out->started
+        && (!ngx_http_proxy_v2_stream_ready(stream) || sess->control
+            || (out->kind == ngx_http_proxy_v2_output_data
+                && (out->payload > (size_t) ngx_max(0, stream->send_window)
+                    || out->payload > sess->send_window))))
+    {
+        ngx_http_proxy_v2_free_output(sess);
+    }
+
+    left = NGX_HTTP_PROXY_V2_SEND_LIMIT;
+
+    for (budget = NGX_HTTP_PROXY_V2_FRAME_LIMIT;
+         budget && left > 0;
+         budget--)
+    {
+        if (ngx_http_proxy_v2_check_deadlines(sess) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (stream && !stream->output_stopped
+            && ngx_http_proxy_v2_send_expired(stream))
+        {
+            return NGX_AGAIN;
+        }
+
+        if (!ngx_http_proxy_v2_write_ready(c)) {
+            break;
+        }
+
+        if (out->kind == ngx_http_proxy_v2_output_none) {
+            if (sess->finishing) {
+                return NGX_OK;
+            }
+
+            if (!sess->preface_sent) {
+                out->kind = ngx_http_proxy_v2_output_preface;
+                out->chain[0].buf = &sess->preface;
+                out->out = &out->chain[0];
+                out->length = ngx_buf_size(&sess->preface);
+
+            } else if (sess->control) {
+                cl = sess->control;
+                sess->control = cl->next;
+                if (sess->control == NULL) {
+                    sess->control_last = &sess->control;
+                }
+
+                cl->next = NULL;
+                out->kind = ngx_http_proxy_v2_output_control;
+                out->control = cl;
+                out->out = cl;
+                out->length = ngx_buf_size(cl->buf);
+
+            } else {
+                if (!ngx_http_proxy_v2_stream_ready(stream)) {
+                    return NGX_OK;
+                }
+
+                rc = ngx_http_proxy_v2_output_stream(stream);
+                if (rc == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+
+                if (rc == NGX_AGAIN) {
+                    continue;
+                }
+            }
+        }
+
+        sent = c->sent;
+        rc = ngx_http_proxy_v2_write(sess, left);
+        left -= c->sent - sent;
+
+        if (rc != NGX_OK) {
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            break;
+        }
+    }
+
+    if (ngx_http_proxy_v2_write_ready(c)
+        && (ngx_http_proxy_v2_output_pending(sess)
+            || ngx_http_proxy_v2_stream_ready(stream)))
+    {
+        ngx_post_event(&sess->write, &ngx_posted_next_events);
+    }
+
+    return ngx_http_proxy_v2_output_pending(sess) ? NGX_AGAIN : NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_output_stream(ngx_http_proxy_v2_stream_t *stream)
+{
+    off_t                         size;
+    u_char                       *p, *end;
+    size_t                        len;
+    ngx_buf_t                    *b;
+    ngx_chain_t                  *cl;
+    ngx_http_proxy_v2_frame_t    *f;
+    ngx_http_proxy_v2_output_t   *out;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    sess = stream->session;
+    out = &sess->output;
+    b = stream->in->buf;
+    size = ngx_buf_size(b);
+
+    if (size < 0) {
+        ngx_log_error(NGX_LOG_ALERT, &sess->log, 0,
+                      "negative size http2 request buffer");
+        return NGX_ERROR;
+    }
+
+    if (stream->header_sent && size == 0 && !b->last_buf) {
+        cl = stream->in;
+        stream->in = cl->next;
+        ngx_free_chain(stream->request->pool, cl);
+        ngx_http_proxy_v2_notify_output(stream);
+        return NGX_AGAIN;
+    }
+
+    if (!stream->header_sent) {
+        out->kind = ngx_http_proxy_v2_output_headers;
+        out->headers.len = size;
+        out->headers.data = ngx_alloc(size, &sess->log);
+        if (out->headers.data == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(out->headers.data, b->pos, size);
+        end = out->headers.data + size;
+
+        /* Own and validate the complete block before committing any bytes. */
+
+        for (p = out->headers.data; p < end; p += sizeof(*f) + len) {
+            if ((size_t) (end - p) < sizeof(*f)) {
+                return NGX_ERROR;
+            }
+
+            f = (ngx_http_proxy_v2_frame_t *) p;
+            len = (f->length_0 << 16) + (f->length_1 << 8) + f->length_2;
+
+            if (len > (size_t) (end - p) - sizeof(*f)
+                || f->type != (p == out->headers.data
+                              ? NGX_HTTP_V2_HEADERS_FRAME
+                              : NGX_HTTP_V2_CONTINUATION_FRAME)
+                || !!(f->flags & NGX_HTTP_V2_END_HEADERS_FLAG)
+                   != (p + sizeof(*f) + len == end))
+            {
+                return NGX_ERROR;
+            }
+
+            f->stream_id_0 = (u_char) (stream->id >> 24);
+            f->stream_id_1 = (u_char) (stream->id >> 16);
+            f->stream_id_2 = (u_char) (stream->id >> 8);
+            f->stream_id_3 = (u_char) stream->id;
+        }
+
+        if (size == 0) {
+            return NGX_ERROR;
+        }
+
+        out->header_pos = out->headers.data;
+        out->end_stream = b->last_buf;
+        ngx_http_proxy_v2_output_header(out);
+
+    } else {
+        len = ngx_min((size_t) ngx_max(0, stream->send_window),
+                      sess->send_window);
+        len = ngx_min(len, NGX_HTTP_V2_DEFAULT_FRAME_SIZE);
+        len = (size_t) ngx_min((off_t) len, size);
+
+        out->kind = ngx_http_proxy_v2_output_data;
+        out->payload = len;
+        out->length = sizeof(*f) + len;
+        out->end_stream = b->last_buf && size == (off_t) len;
+
+        f = (ngx_http_proxy_v2_frame_t *) out->frame;
+        f->length_0 = (u_char) (len >> 16);
+        f->length_1 = (u_char) (len >> 8);
+        f->length_2 = (u_char) len;
+        f->type = NGX_HTTP_V2_DATA_FRAME;
+        f->flags = out->end_stream ? NGX_HTTP_V2_END_STREAM_FLAG : 0;
+        f->stream_id_0 = (u_char) (stream->id >> 24);
+        f->stream_id_1 = (u_char) (stream->id >> 16);
+        f->stream_id_2 = (u_char) (stream->id >> 8);
+        f->stream_id_3 = (u_char) stream->id;
+
+        out->buf[0].pos = out->frame;
+        out->buf[0].last = out->frame + sizeof(*f);
+        out->buf[0].temporary = 1;
+        out->buf[0].flush = 1;
+        out->chain[0].buf = &out->buf[0];
+        out->out = &out->chain[0];
+
+        if (len) {
+            if (ngx_buf_in_memory(b)) {
+                if (sess->send_buffer == NULL) {
+                    sess->send_buffer = ngx_palloc(sess->pool,
+                                                NGX_HTTP_V2_DEFAULT_FRAME_SIZE);
+                    if (sess->send_buffer == NULL) {
+                        return NGX_ERROR;
+                    }
+                }
+
+                ngx_memcpy(sess->send_buffer, b->pos, len);
+                out->buf[1].pos = sess->send_buffer;
+                out->buf[1].last = sess->send_buffer + len;
+                out->buf[1].temporary = 1;
+
+            } else {
+                if (ngx_http_proxy_v2_output_file(sess, b->file) != NGX_OK) {
+                    return NGX_ERROR;
+                }
+
+                out->buf[1].in_file = 1;
+                out->buf[1].file = &out->file;
+                out->buf[1].file_pos = b->file_pos;
+                out->buf[1].file_last = b->file_pos + len;
+            }
+
+            out->buf[1].flush = 1;
+            out->chain[1].buf = &out->buf[1];
+            out->chain[0].next = &out->chain[1];
+        }
+    }
+
+    out->source = b;
+    out->stream_id = stream->id;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_output_header(ngx_http_proxy_v2_output_t *out)
+{
+    ngx_http_proxy_v2_frame_t  *f;
+
+    f = (ngx_http_proxy_v2_frame_t *) out->header_pos;
+    out->length = sizeof(*f) + (f->length_0 << 16)
+                  + (f->length_1 << 8) + f->length_2;
+    out->buf[0].pos = out->header_pos;
+    out->header_pos += out->length;
+    out->buf[0].last = out->header_pos;
+    out->buf[0].temporary = 1;
+    out->buf[0].flush = 1;
+    out->chain[0].buf = &out->buf[0];
+    out->out = &out->chain[0];
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_output_file(ngx_http_proxy_v2_session_t *sess,
+    ngx_file_t *file)
+{
+    ngx_http_proxy_v2_output_t  *out;
+
+    out = &sess->output;
+
+#if (NGX_WIN32)
+    if (!DuplicateHandle(GetCurrentProcess(), file->fd, GetCurrentProcess(),
+                         &out->file.fd, 0, 0, DUPLICATE_SAME_ACCESS))
+    {
+        ngx_log_error(NGX_LOG_ERR, &sess->log, ngx_errno,
+                      "DuplicateHandle() failed");
+        return NGX_ERROR;
+    }
+#else
+    out->file.fd = dup(file->fd);
+    if (out->file.fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, &sess->log, ngx_errno, "dup() failed");
+        return NGX_ERROR;
+    }
+#endif
+
+    /* File names, tasks and callbacks must not retain request storage. */
+
+    ngx_str_set(&out->file.name, "http2 request body");
+    out->file.log = &sess->log;
+    out->file.directio = file->directio;
+    out->file_owned = 1;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_write(ngx_http_proxy_v2_session_t *sess, off_t limit)
+{
+    off_t                        sent, rest, size;
+    ngx_chain_t                 *cl, *chain;
+    ngx_connection_t            *c;
+    ngx_http_proxy_v2_output_t  *out;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    c = sess->connection;
+    out = &sess->output;
+    stream = ngx_http_proxy_v2_find_stream(sess, out->stream_id);
+    sent = c->sent;
+
+    while (out->out && ngx_buf_size(out->out->buf) == 0) {
+        out->out = out->out->next;
+    }
+
+    chain = out->out;
+    size = 0;
+
+    for (cl = chain; cl; cl = cl->next) {
+        size += ngx_buf_size(cl->buf);
+    }
+
+    if (chain || c->buffered) {
+        /* Preserve the address and length of an outstanding SSL_write(). */
+
+        chain = c->send_chain(c, c->buffered ? NULL : chain, limit);
+    }
+
+    if (stream && out->source) {
+        stream->connection.sent += c->sent - sent;
+    }
+
+    /* A later error does not undo bytes already accepted by the transport. */
+
+    rest = 0;
+    for (cl = out->out; cl; cl = cl->next) {
+        rest += ngx_buf_size(cl->buf);
+    }
+
+    if (!out->started && rest != (off_t) out->length) {
+        out->started = 1;
+
+        if (out->kind == ngx_http_proxy_v2_output_headers && stream) {
+            stream->header_started = 1;
+            sess->last_opened_id = stream->id;
+
+        } else if (out->kind == ngx_http_proxy_v2_output_data) {
+            sess->send_window -= out->payload;
+            if (stream) {
+                stream->send_window -= out->payload;
+            }
+        }
+    }
+
+    if (ngx_http_proxy_v2_check_deadlines(sess) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (stream && out->source && !ngx_http_proxy_v2_send_expired(stream)
+        && (rest != size || c->sent != sent))
+    {
+        stream->send_deadline = ngx_current_msec + sess->conf->send_timeout;
+        ngx_http_proxy_v2_write_timer(stream->request);
+    }
+
+    if (chain == NGX_CHAIN_ERROR) {
+        return NGX_ERROR;
+    }
+
+    while (out->out && ngx_buf_size(out->out->buf) == 0) {
+        out->out = out->out->next;
+    }
+
+    if (out->out || c->buffered) {
+        return NGX_AGAIN;
+    }
+
+    if (out->kind == ngx_http_proxy_v2_output_headers
+        && out->header_pos < out->headers.data + out->headers.len)
+    {
+        ngx_http_proxy_v2_output_header(out);
+        return NGX_OK;
+    }
+
+    ngx_http_proxy_v2_finish_output(sess);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_finish_output(ngx_http_proxy_v2_session_t *sess)
+{
+    ngx_buf_t                   *b;
+    ngx_chain_t                 *cl;
+    ngx_http_proxy_v2_output_t  *out;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    out = &sess->output;
+    stream = ngx_http_proxy_v2_find_stream(sess, out->stream_id);
+    b = out->source;
+
+    if (stream && b) {
+        if (out->kind == ngx_http_proxy_v2_output_headers) {
+            b->pos = b->last;
+            stream->header_sent = 1;
+
+        } else {
+            if (ngx_buf_in_memory(b)) {
+                b->pos += out->payload;
+            }
+
+            if (b->in_file) {
+                b->file_pos += out->payload;
+            }
+        }
+
+        if (ngx_buf_size(b) == 0) {
+            cl = stream->in;
+            stream->in = cl->next;
+            ngx_free_chain(stream->request->pool, cl);
+        }
+    }
+
+    if (stream && out->end_stream) {
+        stream->output_closed = 1;
+    }
+
+    if (stream && b) {
+        ngx_http_proxy_v2_notify_output(stream);
+    }
+
+    if (out->kind == ngx_http_proxy_v2_output_preface) {
+        sess->preface_sent = 1;
+        ngx_del_timer(&sess->output_timer);
+    }
+
+    ngx_http_proxy_v2_free_output(sess);
+}
+
+
+static void
+ngx_http_proxy_v2_free_output(ngx_http_proxy_v2_session_t *sess)
+{
+    ngx_chain_t                 *cl;
+    ngx_http_proxy_v2_output_t  *out;
+
+    out = &sess->output;
+
+    if (out->headers.data) {
+        ngx_free(out->headers.data);
+    }
+
+    if (out->file_owned && ngx_close_file(out->file.fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, &sess->log, ngx_errno,
+                      ngx_close_file_n " failed");
+    }
+
+    if (out->control) {
+        cl = out->control;
+        cl->buf->pos = cl->buf->start;
+        cl->buf->last = cl->buf->start;
+        cl->next = sess->control_free;
+        sess->control_free = cl;
+        sess->pending_controls--;
+
+        if (sess->pending_controls == 0 && sess->control_timer.timer_set) {
+            ngx_del_timer(&sess->control_timer);
+        }
+    }
+
+    ngx_memzero(out, sizeof(*out));
+}
+
+
+static void
+ngx_http_proxy_v2_cancel_output(ngx_http_proxy_v2_stream_t *stream)
+{
+    ngx_chain_t                 *cl;
+    ngx_http_proxy_v2_output_t  *out;
+
+    out = &stream->session->output;
+
+    if (out->source && out->stream_id == stream->id) {
+        if (!out->started) {
+            ngx_http_proxy_v2_free_output(stream->session);
+
+        } else {
+            out->source = NULL;
+        }
+    }
+
+    while (stream->in) {
+        cl = stream->in;
+        stream->in = cl->next;
+        ngx_free_chain(stream->request->pool, cl);
+    }
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_writer(ngx_http_proxy_v2_session_t *sess)
+{
+    ngx_int_t          rc;
+    ngx_connection_t  *c;
+
+    c = sess->connection;
+
+    if (sess->writing) {
+        return NGX_AGAIN;
+    }
+
+    sess->writing = 1;
+    rc = ngx_http_proxy_v2_send(sess);
+    sess->writing = 0;
+
+    if (rc == NGX_ERROR
+        || ngx_handle_write_event(c->write, sess->conf->send_lowat) != NGX_OK)
+    {
+        c->error = 1;
+        return NGX_ERROR;
+    }
+
+    if (c->write->ready && c->tcp_nopush == NGX_TCP_NOPUSH_SET) {
+        if (ngx_tcp_push(c->fd) == -1) {
+            ngx_log_error(NGX_LOG_CRIT, &sess->log, ngx_socket_errno,
+                          ngx_tcp_push_n " failed");
+            c->error = 1;
+            return NGX_ERROR;
+        }
+
+        c->tcp_nopush = NGX_TCP_NOPUSH_UNSET;
+    }
+
+    return rc;
+}
+
+
+static void
+ngx_http_proxy_v2_notify_output(ngx_http_proxy_v2_stream_t *stream)
+{
+    if (!stream->output_stopped) {
+        stream->write.ready = 1;
+        ngx_post_event(&stream->write, &ngx_posted_events);
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_send_expired(ngx_http_proxy_v2_stream_t *stream)
+{
+    if (stream->send_waiting
+        && (ngx_msec_int_t) (stream->send_deadline - ngx_current_msec) <= 0)
+    {
+        stream->send_expired = 1;
+    }
+
+    if (stream->send_expired) {
+        stream->write.timedout = 1;
+        ngx_http_proxy_v2_notify_output(stream);
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static void
+ngx_http_proxy_v2_write_timer(ngx_http_request_t *r)
+{
+    ngx_event_t                 *ev;
+    ngx_http_proxy_v2_peer_t    *peer;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    peer = r->upstream->peer.data;
+    stream = peer->stream;
+    ev = &stream->write;
+
+    if (stream->output_stopped || !stream->send_waiting) {
+        if (ev->timer_set) {
+            ngx_del_timer(ev);
+        }
+
+        return;
+    }
+
+    if (ngx_http_proxy_v2_send_expired(stream)) {
+        return;
+    }
+
+    ev->timedout = 0;
+    ngx_add_timer(ev, stream->send_deadline - ngx_current_msec);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_check_deadlines(ngx_http_proxy_v2_session_t *sess)
+{
+    if (sess->output_timer.timer_set
+        && (ngx_msec_int_t) (sess->output_deadline - ngx_current_msec) <= 0)
+    {
+        ngx_log_error(NGX_LOG_ERR, &sess->log, NGX_ETIMEDOUT,
+                      "upstream http2 output timed out");
+        sess->connection->timedout = 1;
+        return NGX_ERROR;
+    }
+
+    if (sess->control_timer.timer_set
+        && (ngx_msec_int_t) (sess->control_deadline - ngx_current_msec) <= 0)
+    {
+        ngx_log_error(NGX_LOG_ERR, &sess->log, NGX_ETIMEDOUT,
+                      "upstream http2 control output timed out");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_stop_output(ngx_http_proxy_v2_stream_t *stream)
+{
+    ngx_http_request_t   *r;
+    ngx_http_upstream_t  *u;
+
+    if (stream->output_stopped) {
+        return;
+    }
+
+    r = stream->request;
+    u = r->upstream;
+
+    (void) ngx_http_proxy_v2_send_expired(stream);
+
+    if (stream->output_closed && !stream->send_expired) {
+        u->request_body_sent = 1;
+    }
+
+    stream->output_stopped = 1;
+    stream->send_waiting = 0;
+    ngx_http_proxy_v2_cancel_output(stream);
+
+    if (stream->write.timer_set) {
+        ngx_del_timer(&stream->write);
+    }
+
+    if (stream->write.posted) {
+        ngx_delete_posted_event(&stream->write);
+    }
+
+    u->request_body_blocked = 0;
+
+    if (r->request_body_no_buffering) {
+        r->read_event_handler = ngx_http_proxy_v2_block_reading;
+        ngx_http_proxy_v2_block_reading(r);
+    }
+
+    if (!stream->output_closed) {
+        ngx_http_proxy_v2_finish_session(stream->session);
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_block_reading(ngx_http_request_t *r)
+{
+    ngx_event_t       *rev;
+    ngx_connection_t  *c;
+
+    c = r->connection;
+    rev = c->read;
+
+    /*
+     * HTTP/2 input can rearm the body timer after output has stopped.
+     * Leave posted reads for transport work and client-close handling.
+     */
+
+    if (rev->timer_set) {
+        ngx_del_timer(rev);
+    }
+
+    rev->timedout = 0;
+
+#if (NGX_HTTP_V2)
+    if (r->stream) {
+        return;
+    }
+#endif
+
+#if (NGX_HTTP_V3)
+    if (c->quic) {
+        return;
+    }
+#endif
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_read_handler) {
+        return;
+    }
+#endif
+
+    if ((ngx_event_flags & NGX_USE_LEVEL_EVENT)
+        && rev->active
+        && ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK)
+    {
+        /* Defer forced request termination to a client event handler. */
+
+        c->error = 1;
+        c->close = 1;
+        ngx_post_event(rev, &ngx_posted_events);
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_finish_session(ngx_http_proxy_v2_session_t *sess)
+{
+    ngx_msec_t         deadline;
+    ngx_msec_int_t     timeout;
+    ngx_connection_t  *c;
+
+    if (sess->closing || sess->finishing) {
+        return;
+    }
+
+    c = sess->connection;
+
+    if (!sess->output.started || c->error || c->close
+        || c->read->error || c->write->error)
+    {
+        ngx_http_proxy_v2_close_session(sess);
+        return;
+    }
+
+    ngx_http_proxy_v2_remove_idle(sess);
+    sess->finishing = 1;
+    deadline = ngx_current_msec + sess->conf->send_timeout;
+
+    /* An earlier startup deadline remains authoritative. */
+
+    if (!sess->output_timer.timer_set
+        || (ngx_msec_int_t) (deadline - sess->output_deadline) < 0)
+    {
+        sess->output_deadline = deadline;
+    }
+
+    timeout = sess->output_deadline - ngx_current_msec;
+    ngx_add_timer(&sess->output_timer, ngx_max(0, timeout));
+    ngx_post_event(&sess->idle_read, &ngx_posted_next_events);
+    ngx_post_event(&sess->write, &ngx_posted_next_events);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_discard_input(ngx_http_proxy_v2_session_t *sess)
+{
+    size_t             left, size;
+    ssize_t            n;
+    ngx_connection_t  *c;
+
+    c = sess->connection;
+
+    /* A retired single-stream session never resumes the HTTP/2 parser. */
+
+    if (sess->buffer == NULL) {
+        sess->buffer = ngx_create_temp_buf(sess->pool, 4096);
+        if (sess->buffer == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_read_handler) {
+        return ngx_handle_read_event(c->read, 0);
+    }
+#endif
+
+    for (left = NGX_HTTP_PROXY_V2_READ_LIMIT; left; left -= n) {
+        size = ngx_min((size_t) (sess->buffer->end - sess->buffer->start), left);
+        n = c->recv(c, sess->buffer->start, size);
+
+        if (n == NGX_AGAIN) {
+            return ngx_handle_read_event(c->read, 0);
+        }
+
+        if (n <= 0) {
+            return NGX_ERROR;
+        }
+    }
+
+    ngx_post_event(&sess->idle_read, &ngx_posted_next_events);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_write_handler(ngx_event_t *ev)
+{
+    ngx_http_proxy_v2_session_t  *sess = ev->data;
+
+    ngx_int_t   rc;
+    ngx_uint_t  pending;
+
+    if (sess->closing || sess->writing) {
+        return;
+    }
+
+    sess->ref_count++;
+
+    pending = sess->pending_controls;
+    rc = ngx_http_proxy_v2_writer(sess);
+
+    if (rc == NGX_ERROR
+        || (sess->finishing
+            && sess->output.kind == ngx_http_proxy_v2_output_none))
+    {
+        ngx_http_proxy_v2_close_session(sess);
+
+    } else if (sess->idle) {
+        if (sess->pending_controls < pending
+            && sess->pending_controls < NGX_HTTP_PROXY_V2_MAX_CONTROL - 2)
+        {
+            /* Resume input after partial as well as complete output. */
+
+            ngx_post_event(&sess->idle_read, &ngx_posted_next_events);
+        }
+    }
+
+    ngx_http_proxy_v2_release_session(sess);
+}
+
+
+static void
+ngx_http_proxy_v2_output_timeout(ngx_event_t *ev)
+{
+    ngx_http_proxy_v2_session_t  *sess = ev->data;
+
+    if ((ngx_msec_int_t) (sess->output_deadline - ngx_current_msec) > 0) {
+        ev->timedout = 0;
+        ngx_add_timer(ev, sess->output_deadline - ngx_current_msec);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, &sess->log, NGX_ETIMEDOUT,
+                  "upstream http2 output timed out");
+
+    sess->connection->timedout = 1;
+    ngx_http_proxy_v2_close_session(sess);
+}
+
+
+static void
+ngx_http_proxy_v2_control_timeout(ngx_event_t *ev)
+{
+    ngx_http_proxy_v2_session_t  *sess = ev->data;
+
+    if ((ngx_msec_int_t) (sess->control_deadline - ngx_current_msec) > 0) {
+        ev->timedout = 0;
+        ngx_add_timer(ev, sess->control_deadline - ngx_current_msec);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, &sess->log, NGX_ETIMEDOUT,
+                  "upstream http2 control output timed out");
+
+    ngx_http_proxy_v2_close_session(sess);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_read_idle(ngx_http_proxy_v2_session_t *sess)
+{
+    size_t             left, size;
+    ssize_t            n;
+    ngx_int_t          rc;
+    ngx_uint_t         frames;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    if (ngx_http_proxy_v2_retain_session(sess) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    c = sess->connection;
+
+    if (sess->buffer == NULL) {
+        sess->buffer = ngx_create_temp_buf(sess->pool, 4096);
+        if (sess->buffer == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    b = sess->buffer;
+    frames = 0;
+    left = NGX_HTTP_PROXY_V2_READ_LIMIT;
+
+    for ( ;; ) {
+        if (b->pos == b->last) {
+            b->pos = b->start;
+            b->last = b->start;
+        }
+
+#if (NGX_HTTP_SSL)
+        if (c->ssl) {
+            if (c->ssl->saved_read_handler) {
+                if (c->read->ready) {
+                    ngx_post_event(&sess->write, &ngx_posted_next_events);
+                }
+
+                return ngx_handle_read_event(c->read, 0);
+            }
+
+            if (c->ssl->saved_write_handler) {
+                if (!c->write->ready) {
+                    goto blocked;
+                }
+
+                /*
+                 * Finish SSL_read() before applying ACK backpressure.
+                 * WANT_WRITE leaves unused space at the buffer's tail.
+                 */
+
+                if (left) {
+                    goto read;
+                }
+            }
+        }
+#endif
+
+        if (frames == NGX_HTTP_PROXY_V2_FRAME_LIMIT || left == 0) {
+            ngx_post_event(&sess->idle_read, &ngx_posted_next_events);
+            return NGX_AGAIN;
+        }
+
+        if (sess->pending_controls >= NGX_HTTP_PROXY_V2_MAX_CONTROL - 2) {
+            goto blocked;
+        }
+
+        if (b->pos == b->last
+            && (sess->state < ngx_http_proxy_v2_st_payload || sess->rest))
+        {
+            goto read;
+        }
+
+        if (sess->state < ngx_http_proxy_v2_st_payload) {
+            rc = ngx_http_proxy_v2_parse_frame(sess, b);
+
+            if (rc == NGX_AGAIN) {
+                continue;
+            }
+
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            frames++;
+            sess->padding = 0;
+        }
+
+        if (sess->stream_id) {
+            rc = ngx_http_proxy_v2_process_closed_frame(sess, b);
+
+        } else {
+            rc = ngx_http_proxy_v2_process_control_frame(sess, NULL, b);
+
+            if (rc == NGX_DECLINED) {
+                rc = ngx_http_proxy_v2_skip_frame(sess, b);
+            }
+        }
+
+        if (rc == NGX_ERROR || sess->goaway) {
+            return NGX_ERROR;
+        }
+
+        continue;
+
+    read:
+
+        size = ngx_min((size_t) (b->end - b->last), left);
+        n = c->recv(c, b->last, size);
+
+        if (n == NGX_AGAIN) {
+#if (NGX_HTTP_SSL)
+            if (c->ssl && c->ssl->saved_write_handler) {
+                goto blocked;
+            }
+#endif
+
+            if (b->pos != b->last) {
+                continue;
+            }
+
+            return ngx_handle_read_event(c->read, 0);
+        }
+
+        if (n <= 0) {
+            return NGX_ERROR;
+        }
+
+        b->last += n;
+        left -= n;
+    }
+
+blocked:
+
+    /* Stop socket input while ACK output or a TLS write is blocked. */
+
+    if (c->read->active && ngx_del_event(c->read, NGX_READ_EVENT, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+static void
+ngx_http_proxy_v2_idle_read_handler(ngx_event_t *ev)
+{
+    ngx_http_proxy_v2_session_t  *sess = ev->data;
+
+    ngx_int_t  rc;
+
+    if ((!sess->idle && !sess->finishing) || sess->closing || sess->reading) {
+        return;
+    }
+
+    sess->ref_count++;
+    sess->reading = 1;
+
+    if (sess->finishing) {
+        rc = ngx_http_proxy_v2_discard_input(sess);
+
+        if (rc != NGX_ERROR && ngx_http_proxy_v2_write_ready(sess->connection)) {
+            ngx_post_event(&sess->write, &ngx_posted_next_events);
+        }
+
+    } else {
+        rc = ngx_http_proxy_v2_read_idle(sess);
+    }
+
+    if (rc != NGX_ERROR
+        && ngx_handle_write_event(sess->connection->write, 0) != NGX_OK)
+    {
+        rc = NGX_ERROR;
+    }
+
+    if (rc == NGX_ERROR) {
+        ngx_http_proxy_v2_close_session(sess);
+    }
+
+    sess->reading = 0;
+    ngx_http_proxy_v2_release_session(sess);
 }
 
 
@@ -5010,23 +6064,348 @@ ngx_http_proxy_v2_init_peer(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
 {
-    ngx_http_proxy_v2_peer_t  *peer;
+    ngx_http_proxy_v2_peer_t     *peer;
+    ngx_http_proxy_v2_session_t  *session;
 
     peer = r->upstream->peer.data;
 
     if (peer->stream) {
-        /* Retry reinitialization clears the module context after checkout. */
-
-        peer->ctx->stream = peer->stream;
         return NGX_OK;
     }
 
-    peer->session = ngx_http_proxy_v2_create_session(r->upstream);
+    peer->session = ngx_http_proxy_v2_create_session(r);
     if (peer->session == NULL) {
         return NGX_ERROR;
     }
 
-    return ngx_http_proxy_v2_create_stream(r, peer);
+    if (ngx_http_proxy_v2_create_stream(r, peer) != NGX_OK) {
+        session = peer->session;
+        peer->session = NULL;
+        r->upstream->peer.connection = NULL;
+        r->upstream->connection = NULL;
+        r->upstream->writer.connection = NULL;
+        ngx_http_proxy_v2_close_session(session);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_connection_handler(ngx_event_t *ev)
+{
+    ngx_event_t                  *sev;
+    ngx_connection_t             *c, *sc;
+    ngx_rbtree_node_t            *node;
+    ngx_http_proxy_v2_stream_t   *stream;
+    ngx_http_proxy_v2_session_t  *session;
+
+    c = ev->data;
+    session = c->data;
+
+    if (session->closing) {
+        return;
+    }
+
+    if (c->error || c->close || c->read->error || c->write->error
+        || c->write->timedout)
+    {
+        ngx_http_proxy_v2_close_session(session);
+        return;
+    }
+
+    if (session->idle || session->finishing || ev->write) {
+        if (!ev->write) {
+            ngx_post_event(&session->idle_read, &ngx_posted_next_events);
+
+        } else {
+            ngx_post_event(&session->write, &ngx_posted_next_events);
+        }
+
+        return;
+    }
+
+    if (session->nstreams == 0) {
+        return;
+    }
+
+    node = ngx_rbtree_min(session->streams.root, session->streams.sentinel);
+    stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+    sc = &stream->connection;
+
+    if (sc->data == NULL) {
+        return;
+    }
+
+    sev = sc->read;
+
+    /* TLS can redirect readiness from the opposite socket event. */
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK
+        || ngx_handle_write_event(c->write, 0) != NGX_OK)
+    {
+        c->error = 1;
+        ngx_http_proxy_v2_close_session(session);
+        return;
+    }
+
+    sc->error |= c->error || c->close;
+    sev->error |= ev->error;
+    sev->ready = 1;
+
+    ngx_post_event(sev, &ngx_posted_events);
+}
+
+
+static void
+ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
+{
+    ngx_int_t                    rc;
+    ngx_connection_t            *c;
+    ngx_http_request_t          *r;
+    ngx_http_upstream_t         *u;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    c = ev->data;
+    stream = (ngx_http_proxy_v2_stream_t *) c;
+
+    if (ev->write) {
+        if (stream->output_stopped) {
+            return;
+        }
+
+        if (ngx_http_proxy_v2_send_expired(stream)) {
+            /* This callback is already delivering the timeout. */
+
+            if (ev->posted) {
+                ngx_delete_posted_event(ev);
+            }
+
+        } else if (ev->timedout) {
+            ngx_http_proxy_v2_write_timer(stream->request);
+            return;
+        }
+
+        goto done;
+    }
+
+    if (ev->timedout
+        || (!ev->write && stream->session->closing && stream->done))
+    {
+        goto done;
+    }
+
+    rc = ngx_http_proxy_v2_test_io(c, ev->write);
+
+    if (rc == NGX_AGAIN) {
+        return;
+    }
+
+    if (rc == NGX_ERROR) {
+        r = c->data;
+        u = r->upstream;
+
+        /* Failure must reach a pipe which has no receive buffer available. */
+
+        if (u->pipe && u->pipe->upstream == c) {
+            u->pipe->upstream_error = 1;
+        }
+
+        ev = c->read;
+        ev->error = 1;
+        ev->ready = 1;
+        ev->delayed = 0;
+
+        if (ev->timer_set) {
+            ngx_del_timer(ev);
+        }
+    }
+
+done:
+
+    ngx_http_upstream_handler(ev);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_test_io(ngx_connection_t *c, ngx_uint_t write)
+{
+    ngx_event_t                 *ev;
+    ngx_connection_t            *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *) c;
+    pc = stream->session->connection;
+
+    if (stream->session->closing || pc == NULL
+        || c->error || c->read->error || c->write->error
+        || pc->error || pc->close || pc->read->error || pc->write->error)
+    {
+        c->error = 1;
+        ev = write ? c->write : c->read;
+        ev->ready = 0;
+        ev->error = 1;
+        return NGX_ERROR;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (pc->ssl) {
+        if (write && pc->ssl->saved_write_handler) {
+            c->write->ready = 0;
+
+            if (pc->write->ready) {
+                c->read->ready = 1;
+                ngx_post_event(c->read, &ngx_posted_events);
+            }
+
+            return NGX_AGAIN;
+        }
+
+        if (!write && pc->ssl->saved_read_handler) {
+            c->read->ready = 0;
+
+            if (pc->read->ready) {
+                ngx_post_event(&stream->session->write,
+                               &ngx_posted_next_events);
+            }
+
+            return NGX_AGAIN;
+        }
+
+        if (write && pc->ssl->saved_read_handler && !pc->read->ready) {
+            c->write->ready = 0;
+            return NGX_AGAIN;
+        }
+
+        if (!write && pc->ssl->saved_write_handler && !pc->write->ready) {
+            c->read->ready = 0;
+            return NGX_AGAIN;
+        }
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_set_read_handler(ngx_connection_t *c,
+    ngx_event_handler_pt handler)
+{
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_read_handler) {
+        c->ssl->saved_read_handler = handler;
+        return;
+    }
+#endif
+
+    c->read->handler = handler;
+}
+
+
+static void
+ngx_http_proxy_v2_set_write_handler(ngx_connection_t *c,
+    ngx_event_handler_pt handler)
+{
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_write_handler) {
+        c->ssl->saved_write_handler = handler;
+        return;
+    }
+#endif
+
+    c->write->handler = handler;
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf, size_t size)
+{
+    ssize_t                      n;
+    ngx_connection_t            *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *) c;
+    pc = stream->session->connection;
+
+    if (stream->session->closing && stream->done) {
+        c->read->ready = 0;
+        c->read->eof = 1;
+        return 0;
+    }
+
+    n = ngx_http_proxy_v2_test_io(c, 0);
+    if (n != NGX_OK) {
+        return n;
+    }
+
+    n = pc->recv(pc, buf, size);
+
+    return ngx_http_proxy_v2_handle_stream_read(c, n);
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+{
+    ssize_t                      n;
+    ngx_connection_t            *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *) c;
+    pc = stream->session->connection;
+
+    if (stream->session->closing && stream->done) {
+        c->read->ready = 0;
+        c->read->eof = 1;
+        return 0;
+    }
+
+    n = ngx_http_proxy_v2_test_io(c, 0);
+    if (n != NGX_OK) {
+        return n;
+    }
+
+    n = pc->recv_chain(pc, in, limit);
+
+    return ngx_http_proxy_v2_handle_stream_read(c, n);
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_handle_stream_read(ngx_connection_t *c, ssize_t n)
+{
+    ngx_connection_t            *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *) c;
+    pc = stream->session->connection;
+
+    c->read->ready = pc->read->ready;
+    c->read->eof = pc->read->eof;
+    c->read->error = pc->read->error;
+    c->error |= pc->error;
+
+    if (n == NGX_AGAIN) {
+        c->read->ready = 0;
+
+        if (pc->read->posted) {
+            ngx_delete_posted_event(pc->read);
+        }
+    }
+
+    if (ngx_handle_read_event(pc->read, pc->read->eof ? NGX_CLOSE_EVENT : 0)
+        != NGX_OK)
+    {
+        pc->error = 1;
+        c->error = 1;
+        c->read->ready = 0;
+        c->read->error = 1;
+        return NGX_ERROR;
+    }
+
+    return n;
 }
 
 
@@ -5035,6 +6414,7 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     ngx_http_proxy_v2_peer_t *peer)
 {
     size_t                        budget;
+    ngx_connection_t             *c, *sc;
     ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *session;
 
@@ -5044,9 +6424,11 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
 
     session = peer->session;
 
-    /* only one stream can use the request-driven I/O path */
+    /* Keep admission serial until shared response dispatch is available. */
 
-    if (session->nstreams) {
+    if (session->nstreams || session->closing || session->finishing
+        || session->goaway)
+    {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "too many active http2 streams");
         return NGX_ERROR;
@@ -5058,6 +6440,7 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     }
 
     stream->session = session;
+    stream->request = r;
     stream->id = session->last_stream_id ? session->last_stream_id + 2 : 1;
     stream->header_budget = budget;
     stream->send_window = session->init_window;
@@ -5066,10 +6449,55 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
     stream->node.key = stream->id;
     ngx_rbtree_insert(&session->streams, &stream->node);
     session->nstreams++;
+    session->ref_count++;
 
     session->last_stream_id = stream->id;
     peer->ctx->stream = stream;
     peer->stream = stream;
+
+    c = session->connection;
+    sc = &stream->connection;
+
+    sc->fd = (ngx_socket_t) -1;
+    sc->transport = 0;
+    sc->data = r;
+    sc->pool = r->pool;
+    sc->log = r->connection->log;
+    sc->read = &stream->read;
+    sc->write = &stream->write;
+    sc->recv = ngx_http_proxy_v2_recv;
+    sc->recv_chain = ngx_http_proxy_v2_recv_chain;
+    sc->sendfile = c->sendfile && r->connection->sendfile;
+    sc->number = c->number;
+    sc->start_time = c->start_time;
+    sc->type = c->type;
+    sc->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+    sc->tcp_nodelay = NGX_TCP_NODELAY_DISABLED;
+
+    sc->read->data = sc;
+    sc->read->log = sc->log;
+    sc->read->index = NGX_INVALID_INDEX;
+    sc->read->available = -1;
+    sc->read->ready = c->read->ready;
+    sc->read->handler = ngx_http_proxy_v2_stream_handler;
+
+    sc->write->data = sc;
+    sc->write->log = sc->log;
+    sc->write->index = NGX_INVALID_INDEX;
+    sc->write->write = 1;
+    sc->write->ready = 1;
+    sc->write->handler = ngx_http_proxy_v2_stream_handler;
+
+    r->upstream->connection = sc;
+    r->upstream->write_timer = ngx_http_proxy_v2_write_timer;
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
 
     return NGX_OK;
 }
@@ -5082,6 +6510,33 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
 
     session = stream->session;
 
+    stream->request->upstream->write_timer = NULL;
+    ngx_http_proxy_v2_stop_output(stream);
+
+    if (stream->read.timer_set) {
+        ngx_del_timer(&stream->read);
+    }
+
+    if (stream->write.timer_set) {
+        ngx_del_timer(&stream->write);
+    }
+
+    if (stream->read.posted) {
+        ngx_delete_posted_event(&stream->read);
+    }
+
+    if (stream->write.posted) {
+        ngx_delete_posted_event(&stream->write);
+    }
+
+    /* Detach the endpoint before releasing its request. */
+
+    if (stream->connection.data) {
+        stream->read.closed = 1;
+        stream->write.closed = 1;
+        stream->connection.data = NULL;
+    }
+
     if (session->header_stream_id == stream->id) {
         session->header_discard = 1;
         ngx_http_proxy_v2_clear_header(session);
@@ -5091,7 +6546,34 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
     session->nstreams--;
 
     stream->in = NULL;
+    stream->request = NULL;
     stream->session = NULL;
+
+    ngx_http_proxy_v2_release_session(session);
+}
+
+
+static ngx_http_proxy_v2_stream_t *
+ngx_http_proxy_v2_find_stream(ngx_http_proxy_v2_session_t *session, ngx_uint_t id)
+{
+    ngx_rbtree_node_t  *node, *sentinel;
+
+    node = session->streams.root;
+    sentinel = session->streams.sentinel;
+
+    while (node != sentinel) {
+        if (id < node->key) {
+            node = node->left;
+
+        } else if (id > node->key) {
+            node = node->right;
+
+        } else {
+            return ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+        }
+    }
+
+    return NULL;
 }
 
 
@@ -5147,11 +6629,15 @@ ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u)
             continue;
         }
 
-        if (ngx_http_proxy_v2_reusable_session(session) != NGX_OK
+        if (ngx_http_proxy_v2_retain_session(session) != NGX_OK
             || (ngx_msec_int_t) (ngx_current_msec
-                                 - session->connection->read->timer.key) >= 0)
+                                 - session->idle_timer.timer.key) >= 0)
         {
             ngx_http_proxy_v2_close_session(session);
+            continue;
+        }
+
+        if (ngx_http_proxy_v2_reusable_session(session) != NGX_OK) {
             continue;
         }
 
@@ -5210,10 +6696,61 @@ ngx_http_proxy_v2_match_session(ngx_http_proxy_v2_session_t *session,
 static ngx_int_t
 ngx_http_proxy_v2_reusable_session(ngx_http_proxy_v2_session_t *session)
 {
+    ngx_connection_t  *c;
+
+    if (ngx_http_proxy_v2_retain_session(session) != NGX_OK) {
+        return NGX_DECLINED;
+    }
+
+    c = session->connection;
+
+    if (!session->preface_sent || session->nstreams) {
+        return NGX_DECLINED;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl && c->ssl->saved_read_handler) {
+        ngx_post_event(&session->write, &ngx_posted_next_events);
+        return NGX_DECLINED;
+    }
+
+    if (c->ssl
+        && (c->ssl->saved_write_handler || SSL_pending(c->ssl->connection)))
+    {
+        ngx_post_event(&session->idle_read, &ngx_posted_next_events);
+        return NGX_DECLINED;
+    }
+#endif
+
+    if (c->read->ready || c->read->posted) {
+        ngx_post_event(&session->idle_read, &ngx_posted_next_events);
+        return NGX_DECLINED;
+    }
+
+    if (session->max_streams == 0
+        || session->state != ngx_http_proxy_v2_st_start
+        || session->header_stream_id || session->write.posted
+        || session->idle_read.posted
+        || ngx_http_proxy_v2_output_pending(session)
+        || (session->buffer && session->buffer->pos != session->buffer->last))
+    {
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_retain_session(ngx_http_proxy_v2_session_t *session)
+{
     ngx_connection_t                   *c;
     const ngx_http_upstream_keepalive_conf_t  *kcf;
 
-    if (session->srv_conf == NULL || session->keepalive == NULL) {
+    if (session->closing || session->connection == NULL
+        || session->finishing || session->srv_conf == NULL
+        || session->keepalive == NULL)
+    {
         return NGX_DECLINED;
     }
 
@@ -5223,18 +6760,14 @@ ngx_http_proxy_v2_reusable_session(ngx_http_proxy_v2_session_t *session)
     if (kcf->max_cached == 0
         || c->requests >= kcf->requests
         || ngx_current_msec - c->start_time > kcf->time
+        || c->error
         || c->close
         || c->read->eof
         || c->read->error
         || c->read->timedout
         || c->write->error
         || c->write->timedout
-        || c->buffered
-        || session->closing
-        || session->nstreams
         || session->goaway
-        || session->state != ngx_http_proxy_v2_st_start
-        || session->header_stream_id
         || session->last_stream_id == 0x7fffffff
         || ngx_terminate
         || ngx_exiting)
@@ -5242,28 +6775,21 @@ ngx_http_proxy_v2_reusable_session(ngx_http_proxy_v2_session_t *session)
         return NGX_DECLINED;
     }
 
-#if (NGX_HTTP_SSL)
-    if (c->ssl
-        && (c->ssl->saved_read_handler || c->ssl->saved_write_handler
-            || SSL_pending(c->ssl->connection)
-            || (c->read->posted && !c->read->ready)))
-    {
-        return NGX_DECLINED;
-    }
-#endif
-
     return NGX_OK;
 }
 
 
 static ngx_http_proxy_v2_session_t *
-ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u)
+ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
 {
     ngx_connection_t             *c;
     ngx_pool_cleanup_t           *cln;
     ngx_peer_connection_t        *pc;
+    ngx_http_upstream_t          *u;
+    ngx_http_core_loc_conf_t     *clcf;
     ngx_http_proxy_v2_session_t  *session;
 
+    u = r->upstream;
     pc = &u->peer;
     c = pc->connection;
 
@@ -5301,7 +6827,50 @@ ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u)
     session->transparent = pc->transparent;
     session->so_keepalive = pc->so_keepalive;
 
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    session->log = *clcf->error_log;
+    session->log.connection = c->number;
+    session->log.handler = ngx_http_proxy_v2_log_error;
+    session->log.data = session;
+    session->log.action = "proxying HTTP/2 upstream";
+
     session->connection = c;
+    session->pool = c->pool;
+    session->ref_count = 1;
+    ngx_queue_insert_tail(&ngx_http_proxy_v2_sessions_queue,
+                          &session->sessions_queue);
+
+    session->preface.start = ngx_http_proxy_v2_connection_start;
+    session->preface.pos = session->preface.start;
+    session->preface.last = session->preface.start
+                           + sizeof(ngx_http_proxy_v2_connection_start) - 1;
+    session->preface.end = session->preface.last;
+    session->preface.memory = 1;
+    session->preface.flush = 1;
+
+    session->control_last = &session->control;
+
+    session->write.handler = ngx_http_proxy_v2_write_handler;
+    session->write.data = session;
+    session->write.log = &session->log;
+
+    session->output_timer.handler = ngx_http_proxy_v2_output_timeout;
+    session->output_timer.data = session;
+    session->output_timer.log = &session->log;
+
+    session->control_timer.handler = ngx_http_proxy_v2_control_timeout;
+    session->control_timer.data = session;
+    session->control_timer.log = &session->log;
+
+    session->idle_read.handler = ngx_http_proxy_v2_idle_read_handler;
+    session->idle_read.data = session;
+    session->idle_read.log = &session->log;
+
+    session->idle_timer.handler = ngx_http_proxy_v2_idle_timeout;
+    session->idle_timer.data = session;
+    session->idle_timer.log = &session->log;
+
+    session->max_streams = (ngx_uint_t) -1;
     ngx_rbtree_init(&session->streams, &session->sentinel,
                     ngx_rbtree_insert_value);
     session->init_window = NGX_HTTP_V2_DEFAULT_WINDOW;
@@ -5314,7 +6883,46 @@ ngx_http_proxy_v2_create_session(ngx_http_upstream_t *u)
     ngx_rbtree_insert(&ngx_http_proxy_v2_sessions, &session->node);
     session->registered = 1;
 
+    c->data = session;
+    c->log = &session->log;
+    c->pool->log = c->log;
+    c->read->log = c->log;
+    c->write->log = c->log;
+
+    ngx_http_proxy_v2_set_read_handler(c,
+                                          ngx_http_proxy_v2_connection_handler);
+    ngx_http_proxy_v2_set_write_handler(c,
+                                          ngx_http_proxy_v2_connection_handler);
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl) {
+        c->ssl->handler = NULL;
+        c->ssl->save_session = u->conf->ssl_session_reuse
+                              ? ngx_http_proxy_v2_ssl_save_session : NULL;
+    }
+#endif
+
+    session->output_deadline = ngx_current_msec + u->conf->send_timeout;
+    ngx_add_timer(&session->output_timer, u->conf->send_timeout);
+    ngx_post_event(&session->write, &ngx_posted_next_events);
+
     return session;
+}
+
+
+static u_char *
+ngx_http_proxy_v2_log_error(ngx_log_t *log, u_char *buf, size_t len)
+{
+    ngx_http_proxy_v2_session_t  *session = log->data;
+
+    ngx_str_t  address;
+    u_char     text[NGX_SOCKADDR_STRLEN];
+
+    address.data = text;
+    address.len = ngx_sock_ntop((struct sockaddr *) &session->sockaddr,
+                               session->socklen, text, sizeof(text), 1);
+
+    return ngx_snprintf(buf, len, ", upstream: \"%V\"", &address);
 }
 
 
@@ -5343,6 +6951,15 @@ ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc, void *data)
         pc->cached = 0;
 
         if (c) {
+            c->data = NULL;
+            c->log = ngx_cycle->log;
+            c->read->log = c->log;
+            c->write->log = c->log;
+
+            if (c->pool) {
+                c->pool->log = c->log;
+            }
+
             ngx_http_proxy_v2_close_connection(c);
         }
     }
@@ -5352,39 +6969,22 @@ ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc, void *data)
         return NGX_OK;
     }
 
-    ngx_http_proxy_v2_remove_idle(session);
-
     c = session->connection;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "http2 pool using connection %p", c);
 
-    c->sent = 0;
-    c->data = NULL;
-    c->log = pc->log;
-    c->read->log = pc->log;
-    c->write->log = pc->log;
-    c->pool->log = pc->log;
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    if (c->read->posted) {
-        ngx_delete_posted_event(c->read);
-    }
-
-    if (c->write->posted) {
-        ngx_delete_posted_event(c->write);
-    }
-
-    pc->connection = c;
-    pc->cached = 1;
     peer->session = session;
 
     if (ngx_http_proxy_v2_create_stream(peer->request, peer) != NGX_OK) {
+        peer->session = NULL;
         return NGX_ERROR;
     }
+
+    ngx_http_proxy_v2_remove_idle(session);
+
+    pc->connection = c;
+    pc->cached = 1;
 
     return NGX_DONE;
 }
@@ -5394,6 +6994,10 @@ static void
 ngx_http_proxy_v2_remove_idle(ngx_http_proxy_v2_session_t *session)
 {
     if (session->idle) {
+        if (session->idle_timer.timer_set) {
+            ngx_del_timer(&session->idle_timer);
+        }
+
         ngx_queue_remove(&session->queue);
 #if (NGX_HTTP_UPSTREAM_KEEPALIVE)
         ngx_http_upstream_keepalive_release(session->idle_slot);
@@ -5408,20 +7012,113 @@ ngx_http_proxy_v2_remove_idle(ngx_http_proxy_v2_session_t *session)
 static void
 ngx_http_proxy_v2_close_session(ngx_http_proxy_v2_session_t *session)
 {
+    ngx_connection_t            *c, *sc;
+    ngx_rbtree_node_t           *node;
+    ngx_http_upstream_t         *u;
+    ngx_http_proxy_v2_stream_t  *stream;
+
     if (session->closing) {
         return;
     }
 
+    session->ref_count++;
     ngx_http_proxy_v2_remove_idle(session);
     session->closing = 1;
+    c = session->connection;
 
-    ngx_http_proxy_v2_close_connection(session->connection);
+    if (session->nstreams) {
+        for (node = ngx_rbtree_min(session->streams.root,
+                                  session->streams.sentinel);
+             node; node = ngx_rbtree_next(&session->streams, node))
+        {
+            stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+            u = stream->request->upstream;
+            u->keepalive = 0;
+            u->peer.connection = NULL;
+
+            if (u->connection == c) {
+                u->connection = NULL;
+            }
+
+            if (u->writer.connection == c) {
+                u->writer.connection = NULL;
+            }
+
+            sc = &stream->connection;
+
+            if (sc->data == NULL) {
+                continue;
+            }
+
+            sc->buffered = 0;
+
+            if (stream->done) {
+                u->length = 0;
+
+                if (u->pipe) {
+                    u->pipe->length = 0;
+                }
+
+                sc->read->eof = 1;
+
+            } else {
+                sc->error = 1;
+                sc->read->error = 1;
+            }
+
+            if (sc->read->timer_set) {
+                ngx_del_timer(sc->read);
+            }
+
+            sc->read->timedout = c->timedout && !stream->done;
+            sc->read->delayed = 0;
+
+            if (sc->write->timer_set) {
+                ngx_del_timer(sc->write);
+            }
+
+            if (sc->write->posted) {
+                ngx_delete_posted_event(sc->write);
+            }
+
+            sc->read->ready = 1;
+            ngx_post_event(sc->read, &ngx_posted_events);
+        }
+    }
+
+    ngx_http_proxy_v2_close_connection(c);
+    ngx_http_proxy_v2_release_session(session);
 }
 
 
 static void
 ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
 {
+    ngx_pool_t                   *pool;
+    ngx_http_proxy_v2_session_t  *session;
+
+    session = c->data;
+
+    if (session) {
+        ngx_http_proxy_v2_remove_idle(session);
+
+        if (session->idle_read.posted) {
+            ngx_delete_posted_event(&session->idle_read);
+        }
+
+        if (session->write.posted) {
+            ngx_delete_posted_event(&session->write);
+        }
+
+        if (session->control_timer.timer_set) {
+            ngx_del_timer(&session->control_timer);
+        }
+
+        if (session->output_timer.timer_set) {
+            ngx_del_timer(&session->output_timer);
+        }
+    }
+
     if (c->read->timer_set) {
         ngx_del_timer(c->read);
     }
@@ -5436,15 +7133,6 @@ ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
 
     if (c->write->posted) {
         ngx_delete_posted_event(c->write);
-    }
-
-    c->data = NULL;
-    c->log = ngx_cycle->log;
-    c->read->log = c->log;
-    c->write->log = c->log;
-
-    if (c->pool) {
-        c->pool->log = c->log;
     }
 
 #if (NGX_HTTP_SSL)
@@ -5462,11 +7150,28 @@ ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
 
 #endif
 
-    if (c->pool) {
-        ngx_destroy_pool(c->pool);
-    }
-
+    pool = c->pool;
     ngx_close_connection(c);
+
+    if (session) {
+        session->connection = NULL;
+        ngx_http_proxy_v2_session_cleanup(session);
+        ngx_http_proxy_v2_release_session(session);
+
+    } else if (pool) {
+        ngx_destroy_pool(pool);
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_release_session(ngx_http_proxy_v2_session_t *session)
+{
+    if (--session->ref_count == 0) {
+        ngx_http_proxy_v2_free_output(session);
+        ngx_queue_remove(&session->sessions_queue);
+        ngx_destroy_pool(session->pool);
+    }
 }
 
 
@@ -5477,6 +7182,7 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     ngx_http_proxy_v2_peer_t  *peer = data;
 
     ngx_uint_t                          keep;
+    ngx_msec_t                          timeout;
     ngx_connection_t                   *c;
     ngx_http_upstream_t                *u;
     ngx_http_proxy_v2_stream_t         *stream;
@@ -5489,11 +7195,24 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     session = peer->session;
     stream = peer->stream;
 
+    if (session) {
+        session->ref_count++;
+    }
+
+    if (stream && stream->output_closed && stream->in == NULL
+        && !stream->send_expired)
+    {
+        u->request_body_sent = 1;
+    }
+
     keep = !(state & NGX_PEER_FAILED) && c && stream
            && u->keepalive && u->request_body_sent
            && stream->input_closed && stream->output_closed
-           && stream->in == NULL && peer->ctx->out == NULL
-           && !peer->ctx->output_blocked && u->writer.out == NULL;
+           && stream->in == NULL
+           && !stream->connection.error && !stream->connection.close
+           && !stream->read.eof && !stream->read.error && !stream->read.timedout
+           && !stream->write.error && !stream->write.timedout
+           && !stream->send_expired;
 
     /* module contexts may have been cleared by an internal redirect */
 
@@ -5517,10 +7236,11 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     pc->connection = NULL;
     peer->free(pc, peer->data, state);
 
-    if (!keep || ngx_http_proxy_v2_reusable_session(session) != NGX_OK
+    if (!keep || ngx_http_proxy_v2_retain_session(session) != NGX_OK
         || ngx_handle_read_event(c->read, 0) != NGX_OK)
     {
-        ngx_http_proxy_v2_close_session(session);
+        ngx_http_proxy_v2_finish_session(session);
+        ngx_http_proxy_v2_release_session(session);
         return;
     }
 
@@ -5543,38 +7263,19 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
         ngx_del_timer(c->write);
     }
 
-    if (c->read->posted) {
-        ngx_delete_posted_event(c->read);
-    }
-
-    if (c->write->posted) {
-        ngx_delete_posted_event(c->write);
-    }
-
-    c->data = session;
     c->idle = 1;
     c->read->delayed = 0;
-    c->read->handler = ngx_http_proxy_v2_idle_handler;
-    c->write->handler = ngx_http_proxy_v2_dummy_handler;
-    c->log = ngx_cycle->log;
-    c->pool->log = c->log;
-    c->read->log = c->log;
-    c->write->log = c->log;
-
-#if (NGX_HTTP_SSL)
-    if (c->ssl) {
-        c->ssl->save_session = NULL;
-    }
-#endif
 
     ngx_queue_insert_head(&conf->idle, &session->queue);
     session->idle = 1;
 
-    ngx_add_timer(c->read, kcf->timeout);
+    timeout = ngx_min(kcf->timeout,
+                     kcf->time - (ngx_current_msec - c->start_time));
+    ngx_add_timer(&session->idle_timer, timeout);
 
-    if (c->read->ready) {
-        ngx_http_proxy_v2_idle_handler(c->read);
-    }
+    ngx_post_event(&session->idle_read, &ngx_posted_next_events);
+
+    ngx_http_proxy_v2_release_session(session);
 }
 
 
@@ -5590,38 +7291,14 @@ ngx_http_proxy_v2_evict(ngx_connection_t *c)
 
 
 static void
-ngx_http_proxy_v2_idle_handler(ngx_event_t *ev)
+ngx_http_proxy_v2_idle_timeout(ngx_event_t *ev)
 {
-    char                          buf[1];
-    ssize_t                       n;
-    ngx_connection_t             *c;
-    ngx_http_proxy_v2_session_t  *session;
+    ngx_http_proxy_v2_session_t  *session = ev->data;
 
-    c = ev->data;
-    session = c->data;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http2 pool idle handler");
-
-    if (!c->close && !ev->timedout) {
-        n = recv(c->fd, buf, 1, MSG_PEEK);
-
-        if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
-            ev->ready = 0;
-
-            if (ngx_handle_read_event(ev, 0) == NGX_OK) {
-                return;
-            }
-        }
-    }
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, &session->log, 0,
+                   "http2 pool idle timeout");
 
     ngx_http_proxy_v2_close_session(session);
-}
-
-
-static void
-ngx_http_proxy_v2_dummy_handler(ngx_event_t *ev)
-{
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "http2 pool dummy handler");
 }
 
 
@@ -5652,6 +7329,44 @@ ngx_http_proxy_v2_save_session(ngx_peer_connection_t *pc, void *data)
     ngx_http_proxy_v2_peer_t  *peer = data;
 
     peer->save_session(pc, peer->data);
+}
+
+
+static void
+ngx_http_proxy_v2_ssl_save_session(ngx_connection_t *c)
+{
+    ngx_rbtree_node_t            *node;
+    ngx_http_request_t           *r;
+    ngx_http_upstream_t          *u;
+    ngx_http_proxy_v2_stream_t   *stream;
+    ngx_http_proxy_v2_session_t  *session;
+
+    session = c->data;
+
+    if (session->closing || session->idle || session->nstreams == 0) {
+        return;
+    }
+
+    node = ngx_rbtree_min(session->streams.root, session->streams.sentinel);
+    stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+
+    if (stream->connection.data == NULL) {
+        return;
+    }
+
+    r = stream->connection.data;
+    u = r->upstream;
+
+    if (u->connection != &stream->connection || u->peer.connection != c
+        || u->peer.sockaddr == NULL || u->peer.save_session == NULL
+        || !u->conf->ssl_session_reuse)
+    {
+        return;
+    }
+
+    ngx_http_set_log_request(r->connection->log, r);
+
+    u->peer.save_session(&u->peer, u->peer.data);
 }
 
 #endif
@@ -5714,6 +7429,8 @@ ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle)
                     &ngx_http_proxy_v2_sessions_sentinel,
                     ngx_rbtree_insert_value);
 
+    ngx_queue_init(&ngx_http_proxy_v2_sessions_queue);
+
     return NGX_OK;
 }
 
@@ -5721,28 +7438,51 @@ ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle)
 static void
 ngx_http_proxy_v2_exit_process(ngx_cycle_t *cycle)
 {
+    ngx_queue_t                  *q;
     ngx_connection_t             *c;
     ngx_rbtree_node_t            *node;
+    ngx_http_upstream_t          *u;
+    ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *session;
 
-    while (ngx_http_proxy_v2_sessions.root
-           != ngx_http_proxy_v2_sessions.sentinel)
-    {
-        node = ngx_http_proxy_v2_sessions.root;
-        session = ngx_rbtree_data(node, ngx_http_proxy_v2_session_t, node);
-        c = session->connection;
+    while (!ngx_queue_empty(&ngx_http_proxy_v2_sessions_queue)) {
+        q = ngx_queue_head(&ngx_http_proxy_v2_sessions_queue);
+        session = ngx_queue_data(q, ngx_http_proxy_v2_session_t, sessions_queue);
+        session->ref_count++;
 
         ngx_http_proxy_v2_remove_idle(session);
 
-#if (NGX_HTTP_SSL)
-        if (c->ssl) {
-            c->ssl->save_session = NULL;
-            ngx_ssl_ocsp_cleanup(c);
-            SSL_free(c->ssl->connection);
-            c->ssl = NULL;
+        while (session->nstreams) {
+            node = ngx_rbtree_min(session->streams.root,
+                                 session->streams.sentinel);
+            stream = ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+            u = stream->request->upstream;
+            u->keepalive = 0;
+            ngx_http_proxy_v2_free_peer(&u->peer, u->peer.data, 0);
+            u->peer.sockaddr = NULL;
+            u->connection = NULL;
+            u->writer.connection = NULL;
+
+            if (u->pipe) {
+                u->pipe->upstream = NULL;
+            }
         }
+
+        c = session->connection;
+
+        if (c) {
+#if (NGX_HTTP_SSL)
+            if (c->ssl) {
+                c->ssl->save_session = NULL;
+                ngx_ssl_ocsp_cleanup(c);
+                SSL_free(c->ssl->connection);
+                c->ssl = NULL;
+            }
 #endif
 
-        ngx_http_proxy_v2_close_connection(c);
+            ngx_http_proxy_v2_close_connection(c);
+        }
+
+        ngx_http_proxy_v2_release_session(session);
     }
 }
