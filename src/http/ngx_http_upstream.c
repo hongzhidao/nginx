@@ -91,6 +91,10 @@ static void ngx_http_upstream_thread_event_handler(ngx_event_t *ev);
 #endif
 static ngx_int_t ngx_http_upstream_output_filter(void *data,
     ngx_chain_t *chain);
+static ngx_int_t ngx_http_upstream_pipe(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_int_t do_write);
+static ngx_int_t ngx_http_upstream_pipe_input_error(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
 static void ngx_http_upstream_process_downstream(ngx_http_request_t *r);
 static void ngx_http_upstream_process_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
@@ -4406,6 +4410,29 @@ ngx_http_upstream_output_filter(void *data, ngx_chain_t *chain)
 }
 
 
+static ngx_int_t
+ngx_http_upstream_pipe(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_int_t do_write)
+{
+#if (NGX_HAVE_FILE_AIO || NGX_THREADS)
+    u->pipe->aio = r->aio;
+#endif
+
+    return ngx_event_pipe(u->pipe, do_write);
+}
+
+
+static ngx_int_t
+ngx_http_upstream_pipe_input_error(ngx_http_request_t *r, ngx_http_upstream_t *u)
+{
+#if (NGX_HAVE_FILE_AIO || NGX_THREADS)
+    u->pipe->aio = r->aio;
+#endif
+
+    return ngx_event_pipe_input_error(u->pipe);
+}
+
+
 static void
 ngx_http_upstream_process_downstream(ngx_http_request_t *r)
 {
@@ -4448,7 +4475,7 @@ ngx_http_upstream_process_downstream(ngx_http_request_t *r)
             return;
         }
 
-        if (ngx_event_pipe(p, 1) == NGX_ABORT) {
+        if (ngx_http_upstream_pipe(r, u, 1) == NGX_ABORT) {
             ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
             return;
         }
@@ -4463,11 +4490,9 @@ ngx_http_upstream_process_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
 {
     ngx_event_t       *rev;
-    ngx_event_pipe_t  *p;
     ngx_connection_t  *c;
 
     c = u->peer.connection;
-    p = u->pipe;
     rev = c->read;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
@@ -4477,8 +4502,14 @@ ngx_http_upstream_process_upstream(ngx_http_request_t *r,
 
     if (rev->timedout) {
 
-        p->upstream_error = 1;
         ngx_connection_error(c, NGX_ETIMEDOUT, "upstream timed out");
+
+        /* Preserve the ordering of received data and the timeout error. */
+
+        if (ngx_http_upstream_pipe_input_error(r, u) == NGX_ABORT) {
+            ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
+            return;
+        }
 
     } else {
 
@@ -4494,7 +4525,7 @@ ngx_http_upstream_process_upstream(ngx_http_request_t *r,
             return;
         }
 
-        if (ngx_event_pipe(p, 0) == NGX_ABORT) {
+        if (ngx_http_upstream_pipe(r, u, 0) == NGX_ABORT) {
             ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
             return;
         }
@@ -4518,11 +4549,11 @@ ngx_http_upstream_process_request(ngx_http_request_t *r,
     if (p->writing && !p->aio) {
 
         /*
-         * make sure to call ngx_event_pipe()
+         * make sure to run the pipe
          * if there is an incomplete aio write
          */
 
-        if (ngx_event_pipe(p, 1) == NGX_ABORT) {
+        if (ngx_http_upstream_pipe(r, u, 1) == NGX_ABORT) {
             ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
             return;
         }
@@ -4534,7 +4565,7 @@ ngx_http_upstream_process_request(ngx_http_request_t *r,
 
 #endif
 
-    if (u->peer.connection) {
+    if (u->peer.connection && ngx_event_pipe_input_complete(p)) {
 
         if (u->store) {
 
@@ -4964,6 +4995,12 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     u->finalize_request(r, rc);
 
     ngx_http_upstream_free_peer(u, 0);
+
+    /* Protocol finalization and peer release have stopped the producer. */
+
+    if (u->pipe) {
+        ngx_event_pipe_input_cancel(u->pipe);
+    }
 
     if (u->peer.connection) {
 
