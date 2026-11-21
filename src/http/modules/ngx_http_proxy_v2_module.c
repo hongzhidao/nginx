@@ -522,8 +522,7 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
         ctx->ctx.head = 1;
     }
 
-    len = sizeof(ngx_http_proxy_v2_connection_start) - 1
-          + sizeof(ngx_http_proxy_v2_frame_t);             /* headers frame */
+    len = sizeof(ngx_http_proxy_v2_frame_t);               /* headers frame */
 
     headers_len = 0;
 
@@ -773,11 +772,6 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
 
     key_tmp = tmp + tmp_len;
     val_tmp = tmp + 2 * tmp_len;
-
-    /* connection preface */
-
-    b->last = ngx_copy(b->last, ngx_http_proxy_v2_connection_start,
-                       sizeof(ngx_http_proxy_v2_connection_start) - 1);
 
     /* headers frame */
 
@@ -1318,16 +1312,29 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
 
         stream->header_sent = 1;
 
-        b = stream->in->buf;
-        p = b->pos + sizeof(ngx_http_proxy_v2_connection_start) - 1;
+        if (stream->id == 1) {
+            cl = ngx_alloc_chain_link(r->pool);
+            if (cl == NULL) {
+                return NGX_ERROR;
+            }
 
-        if (stream->id != 1) {
-            /* keepalive connection: skip connection preface */
+            cl->buf = ngx_calloc_buf(r->pool);
+            if (cl->buf == NULL) {
+                return NGX_ERROR;
+            }
 
-            b->pos = p;
+            cl->buf->pos = ngx_http_proxy_v2_connection_start;
+            cl->buf->last = cl->buf->pos
+                            + sizeof(ngx_http_proxy_v2_connection_start) - 1;
+            cl->buf->memory = 1;
+            *ll = cl;
+            ll = &cl->next;
         }
 
         /* update stream identifiers, including retries on a new connection */
+
+        b = stream->in->buf;
+        p = b->pos;
 
         while (p < b->last) {
             f = (ngx_http_proxy_v2_frame_t *) p;
