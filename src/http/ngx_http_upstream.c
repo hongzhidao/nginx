@@ -37,6 +37,10 @@ static void ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
     ngx_event_t *ev);
 static void ngx_http_upstream_connect(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
+static ngx_int_t ngx_http_upstream_init_connection(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
+static void ngx_http_upstream_connect_read_handler(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
 static ngx_int_t ngx_http_upstream_reinit(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_upstream_send_request(ngx_http_request_t *r,
@@ -1322,7 +1326,7 @@ failed:
 }
 
 
-static void
+void
 ngx_http_upstream_handler(ngx_event_t *ev)
 {
     ngx_connection_t     *c;
@@ -1663,6 +1667,14 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     c = u->peer.connection;
 
+    u->write_event_handler = ngx_http_upstream_send_request_handler;
+    u->read_event_handler = ngx_http_upstream_process_header;
+
+    if (ngx_connection_shared(c)) {
+        /* The protocol has already installed the stream's event handlers. */
+        goto reinit;
+    }
+
     c->requests++;
 
     c->data = r;
@@ -1670,14 +1682,13 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     c->write->handler = ngx_http_upstream_handler;
     c->read->handler = ngx_http_upstream_handler;
 
-    u->write_event_handler = ngx_http_upstream_send_request_handler;
-    u->read_event_handler = ngx_http_upstream_process_header;
+    if (u->init_connection == NULL) {
+        c->sendfile &= r->connection->sendfile;
+        u->output.sendfile = c->sendfile;
 
-    c->sendfile &= r->connection->sendfile;
-    u->output.sendfile = c->sendfile;
-
-    if (r->connection->tcp_nopush == NGX_TCP_NOPUSH_DISABLED) {
-        c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+        if (r->connection->tcp_nopush == NGX_TCP_NOPUSH_DISABLED) {
+            c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+        }
     }
 
     if (c->pool == NULL) {
@@ -1705,13 +1716,15 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     }
 #endif
 
+reinit:
+
     /* init or reinit the ngx_output_chain() and ngx_chain_writer() contexts */
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
     u->writer.out = NULL;
     u->writer.last = &u->writer.out;
-    u->writer.connection = c;
+    u->writer.connection = u->init_connection ? NULL : c;
     u->writer.limit = clcf->sendfile_max_chunk;
 
     if (u->request_sent || u->response_received) {
@@ -1754,13 +1767,17 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->response_received = 0;
 
     if (rc == NGX_AGAIN) {
+        if (u->init_connection) {
+            u->read_event_handler = ngx_http_upstream_connect_read_handler;
+        }
+
         ngx_add_timer(c->write, u->conf->connect_timeout);
         return;
     }
 
 #if (NGX_HTTP_SSL)
 
-    if (u->ssl && c->ssl == NULL) {
+    if (u->ssl && c->ssl == NULL && !ngx_connection_shared(c)) {
         ngx_http_upstream_ssl_init_connection(r, u, c);
         return;
     }
@@ -2187,6 +2204,59 @@ ngx_http_upstream_reinit(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
 
 static void
+ngx_http_upstream_connect_read_handler(ngx_http_request_t *r,
+    ngx_http_upstream_t *u)
+{
+    ngx_connection_t  *c;
+
+    c = u->peer.connection;
+
+    if (c->read->timedout) {
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT);
+        return;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (u->ssl && c->ssl == NULL) {
+        ngx_http_upstream_ssl_init_connection(r, u, c);
+        return;
+    }
+#endif
+
+    if (ngx_http_upstream_test_connect(c) != NGX_OK) {
+        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+        return;
+    }
+
+    if (ngx_http_upstream_init_connection(r, u) != NGX_OK) {
+        return;
+    }
+
+    /* Read pending input before submitting an unbuffered request body. */
+
+    ngx_post_event(u->peer.connection->write, &ngx_posted_events);
+    ngx_http_upstream_process_header(r, u);
+}
+
+
+static ngx_int_t
+ngx_http_upstream_init_connection(ngx_http_request_t *r, ngx_http_upstream_t *u)
+{
+    if (u->init_connection(r) != NGX_OK || u->peer.connection == NULL) {
+        ngx_http_upstream_finalize_request(r, u,
+                                           NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_ERROR;
+    }
+
+    u->writer.connection = u->peer.connection;
+    u->output.sendfile = u->peer.connection->sendfile;
+    u->read_event_handler = ngx_http_upstream_process_header;
+
+    return NGX_OK;
+}
+
+
+static void
 ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_uint_t do_write)
 {
@@ -2202,9 +2272,19 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         u->state->connect_time = ngx_current_msec - u->start_time;
     }
 
-    if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
-        ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
-        return;
+    if (!u->request_sent) {
+        if (ngx_http_upstream_test_connect(c) != NGX_OK) {
+            ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+            return;
+        }
+
+        if (u->init_connection && u->writer.connection == NULL) {
+            if (ngx_http_upstream_init_connection(r, u) != NGX_OK) {
+                return;
+            }
+
+            c = u->peer.connection;
+        }
     }
 
     c->log->action = "sending request to upstream";
@@ -2442,7 +2522,7 @@ ngx_http_upstream_send_request_handler(ngx_http_request_t *r,
 
 #if (NGX_HTTP_SSL)
 
-    if (u->ssl && c->ssl == NULL) {
+    if (u->ssl && c->ssl == NULL && !ngx_connection_shared(c)) {
         ngx_http_upstream_ssl_init_connection(r, u, c);
         return;
     }
@@ -3066,6 +3146,10 @@ ngx_http_upstream_test_connect(ngx_connection_t *c)
 {
     int        err;
     socklen_t  len;
+
+    if (ngx_connection_shared(c)) {
+        return NGX_OK;
+    }
 
 #if (NGX_HAVE_KQUEUE)
 
