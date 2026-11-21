@@ -98,6 +98,8 @@ static void ngx_http_upstream_dummy_handler(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_upstream_next(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_uint_t ft_type);
+static void ngx_http_upstream_free_peer(ngx_http_upstream_t *u,
+    ngx_uint_t state);
 static void ngx_http_upstream_cleanup(void *data);
 static void ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_int_t rc);
@@ -1684,6 +1686,14 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     c->pool->log = c->log;
     c->read->log = c->log;
     c->write->log = c->log;
+
+#if (NGX_HTTP_SSL)
+    if (u->ssl && c->ssl && u->conf->ssl_session_reuse
+        && !c->ssl->save_session)
+    {
+        c->ssl->save_session = ngx_http_upstream_ssl_save_session;
+    }
+#endif
 
     /* init or reinit the ngx_output_chain() and ngx_chain_writer() contexts */
 
@@ -4624,28 +4634,20 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http next upstream, %xi", ft_type);
 
-    if (u->peer.sockaddr) {
-
-        if (u->peer.connection) {
-            u->state->bytes_sent = u->peer.connection->sent;
-        }
-
-        if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
-            || ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_404)
-        {
-            state = NGX_PEER_NEXT;
-
-        } else {
-            state = NGX_PEER_FAILED;
-        }
-
-        u->peer.free(&u->peer, u->peer.data, state);
-        u->peer.sockaddr = NULL;
-
-#if (NGX_HTTP_UPSTREAM_SID)
-        u->peer.sid = NULL;
-#endif
+    if (u->writer.connection) {
+        u->state->bytes_sent = u->writer.connection->sent;
     }
+
+    if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
+        || ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_404)
+    {
+        state = NGX_PEER_NEXT;
+
+    } else {
+        state = NGX_PEER_FAILED;
+    }
+
+    ngx_http_upstream_free_peer(u, state);
 
     if (ft_type == NGX_HTTP_UPSTREAM_FT_TIMEOUT) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, NGX_ETIMEDOUT,
@@ -4775,6 +4777,38 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
 
 static void
+ngx_http_upstream_free_peer(ngx_http_upstream_t *u, ngx_uint_t state)
+{
+#if (NGX_HTTP_SSL)
+    ngx_connection_t  *c;
+
+    c = u->peer.connection;
+
+    if (c && c->ssl
+        && c->ssl->save_session == ngx_http_upstream_ssl_save_session)
+    {
+        c->ssl->save_session = NULL;
+    }
+#endif
+
+    if (u->peer.free && u->peer.sockaddr) {
+        u->peer.free(&u->peer, u->peer.data, state);
+        u->peer.sockaddr = NULL;
+
+#if (NGX_HTTP_UPSTREAM_SID)
+        u->peer.sid = NULL;
+#endif
+    }
+
+    u->writer.connection = NULL;
+
+    if (u->pipe) {
+        u->pipe->upstream = NULL;
+    }
+}
+
+
+static void
 ngx_http_upstream_cleanup(void *data)
 {
     ngx_http_request_t *r = data;
@@ -4818,21 +4852,14 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
             u->state->response_length = u->pipe->read_length;
         }
 
-        if (u->peer.connection) {
-            u->state->bytes_sent = u->peer.connection->sent;
+        if (u->writer.connection) {
+            u->state->bytes_sent = u->writer.connection->sent;
         }
     }
 
     u->finalize_request(r, rc);
 
-    if (u->peer.free && u->peer.sockaddr) {
-        u->peer.free(&u->peer, u->peer.data, 0);
-        u->peer.sockaddr = NULL;
-
-#if (NGX_HTTP_UPSTREAM_SID)
-        u->peer.sid = NULL;
-#endif
-    }
+    ngx_http_upstream_free_peer(u, 0);
 
     if (u->peer.connection) {
 
@@ -4866,10 +4893,6 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     u->peer.connection = NULL;
-
-    if (u->pipe) {
-        u->pipe->upstream = NULL;
-    }
 
     if (u->pipe && u->pipe->temp_file) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
