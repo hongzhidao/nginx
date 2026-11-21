@@ -232,6 +232,8 @@ static ngx_int_t ngx_http_proxy_v2_parse_frame(
     ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_validate_frame(
     ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_admit_header_block(
+    ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_parse_data(
     ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b, size_t *size);
 static ngx_int_t ngx_http_proxy_v2_process_data(
@@ -2013,7 +2015,7 @@ ngx_http_proxy_v2_cache_header(ngx_http_request_t *r)
 
     ngx_memzero(&sess, sizeof(ngx_http_proxy_v2_session_t));
     sess.connection = r->connection;
-    sess.header_limit = u->conf->buffer_size;
+    sess.conf = u->conf;
 
     umcf = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
 
@@ -3197,7 +3199,17 @@ ngx_http_proxy_v2_parse_frame(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
             sess->state = ngx_http_proxy_v2_st_payload;
             sess->frame_state = 0;
 
-            return ngx_http_proxy_v2_validate_frame(sess);
+            if (ngx_http_proxy_v2_validate_frame(sess) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
+            if (sess->type == NGX_HTTP_V2_HEADERS_FRAME
+                || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME)
+            {
+                return ngx_http_proxy_v2_admit_header_block(sess);
+            }
+
+            return NGX_OK;
 
         /* suppress warning */
         case ngx_http_proxy_v2_st_payload:
@@ -3268,6 +3280,35 @@ ngx_http_proxy_v2_validate_frame(ngx_http_proxy_v2_session_t *sess)
 
 
 static ngx_int_t
+ngx_http_proxy_v2_admit_header_block(ngx_http_proxy_v2_session_t *sess)
+{
+    size_t  size;
+
+    if (sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
+        sess->header_limit = sess->conf->buffer_size;
+        sess->header_block_limit = sess->header_limit;
+        sess->header_size = 0;
+    }
+
+    /* Admit the complete frame before any consumer can read its payload. */
+
+    size = NGX_HTTP_V2_FRAME_HEADER_SIZE + sess->rest;
+
+    if (size > sess->header_block_limit
+        || sess->header_size > sess->header_block_limit - size)
+    {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream sent too large http2 header block");
+        return NGX_ERROR;
+    }
+
+    sess->header_size += size;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_http_proxy_v2_process_header_frame(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b)
 {
@@ -3288,8 +3329,6 @@ ngx_http_proxy_v2_process_header_frame(ngx_http_request_t *r,
     }
 
     if (sess->frame_state == 0 && sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
-        sess->header_limit = r->upstream->conf->buffer_size;
-
         if (sess->flags & NGX_HTTP_V2_END_STREAM_FLAG) {
             stream->end_stream = 1;
         }
@@ -3325,7 +3364,7 @@ static ngx_int_t
 ngx_http_proxy_v2_parse_header(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
 {
     u_char      ch, *p, *last;
-    size_t      min, size;
+    size_t      min;
     ngx_int_t   rc;
     ngx_log_t  *log;
     enum {
@@ -3347,25 +3386,6 @@ ngx_http_proxy_v2_parse_header(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
 
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
                        "http proxy parse header: start");
-
-        if (sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
-            sess->header_block_limit = sess->header_limit;
-            sess->header_size = 0;
-        }
-
-        /* Charge the complete frame once, before consuming its payload. */
-
-        size = NGX_HTTP_V2_FRAME_HEADER_SIZE + sess->rest;
-
-        if (size > sess->header_block_limit
-            || sess->header_size > sess->header_block_limit - size)
-        {
-            ngx_log_error(NGX_LOG_ERR, log, 0,
-                          "upstream sent too large http2 header block");
-            return NGX_ERROR;
-        }
-
-        sess->header_size += size;
 
         if (sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
             sess->header_stream_id = sess->stream_id;
