@@ -259,9 +259,20 @@ typedef struct {
 
 
 typedef struct {
+    ngx_buf_t                     *buf;
+    u_char                        *pos;
+    u_char                        *last;
+    off_t                          file_pos;
+    off_t                          file_last;
+    unsigned                       in_file:1;
+} ngx_http_proxy_v2_request_buf_t;
+
+
+typedef struct {
     ngx_http_proxy_ctx_t           ctx;
 
     ngx_http_proxy_v2_stream_t    *stream;
+    ngx_array_t                    request_bufs;
 
     unsigned                       status:1;
 #if (NGX_HTTP_CACHE)
@@ -303,6 +314,8 @@ typedef struct {
 
 static ngx_int_t ngx_http_proxy_v2_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r);
+static ngx_int_t ngx_http_proxy_v2_save_request(ngx_http_request_t *r);
+static void ngx_http_proxy_v2_restore_request(ngx_http_proxy_v2_ctx_t *ctx);
 static ngx_int_t ngx_http_proxy_v2_init_header_budget(ngx_http_request_t *r,
     size_t *budget);
 static ngx_int_t ngx_http_proxy_v2_account_header(ngx_http_request_t *r,
@@ -1393,7 +1406,59 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
     b->flush = 1;
     cl->next = NULL;
 
+    return ngx_http_proxy_v2_save_request(r);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_save_request(ngx_http_request_t *r)
+{
+    ngx_chain_t                      *cl;
+    ngx_http_proxy_v2_ctx_t          *ctx;
+    ngx_http_proxy_v2_request_buf_t  *saved;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+
+    if (ngx_array_init(&ctx->request_bufs, r->pool, 4,
+                       sizeof(ngx_http_proxy_v2_request_buf_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    for (cl = r->upstream->request_bufs; cl; cl = cl->next) {
+        saved = ngx_array_push(&ctx->request_bufs);
+        if (saved == NULL) {
+            return NGX_ERROR;
+        }
+
+        saved->buf = cl->buf;
+        saved->pos = cl->buf->pos;
+        saved->last = cl->buf->last;
+        saved->file_pos = cl->buf->file_pos;
+        saved->file_last = cl->buf->file_last;
+        saved->in_file = cl->buf->in_file;
+    }
+
     return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_restore_request(ngx_http_proxy_v2_ctx_t *ctx)
+{
+    ngx_uint_t                        i;
+    ngx_http_proxy_v2_request_buf_t  *saved;
+
+    saved = ctx->request_bufs.elts;
+
+    for (i = 0; i < ctx->request_bufs.nelts; i++) {
+        saved[i].buf->pos = saved[i].pos;
+        saved[i].buf->last = saved[i].last;
+        saved[i].buf->file_pos = saved[i].file_pos;
+        saved[i].buf->file_last = saved[i].file_last;
+        saved[i].buf->in_file = saved[i].in_file;
+    }
 }
 
 
@@ -7017,6 +7082,7 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
     }
 
     peer->ctx->stream = peer->stream;
+    ngx_http_proxy_v2_restore_request(peer->ctx);
 
     r->upstream->peer.connection = &peer->stream->connection;
     r->upstream->write_timer = ngx_http_proxy_v2_write_timer;
