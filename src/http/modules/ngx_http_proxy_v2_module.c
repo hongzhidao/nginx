@@ -2137,7 +2137,6 @@ ngx_http_proxy_v2_finish_response(ngx_http_request_t *r,
     }
 
     stream->done = 1;
-    ngx_http_proxy_v2_stop_output(stream);
 
     return NGX_OK;
 }
@@ -6457,6 +6456,19 @@ ngx_http_proxy_v2_close_input(ngx_http_proxy_v2_stream_t *stream)
     stream->input_closed = 1;
     ngx_http_proxy_v2_release_stream(stream);
     ngx_http_proxy_v2_cancel_window_updates(stream->session, stream->id);
+
+    /* Final headers alone can precede a full-duplex request body exchange. */
+
+    ngx_http_proxy_v2_stop_output(stream);
+
+    if (stream->failure) {
+        (void) ngx_http_proxy_v2_fail_stream(stream, stream->failure,
+                                             stream->error);
+
+    } else if (!stream->output_closed) {
+        (void) ngx_http_proxy_v2_cancel_stream(stream, NGX_HTTP_PROXY_V2_CANCEL);
+    }
+
     ngx_http_proxy_v2_read_timer(stream->request);
 
     if (stream->failure) {
@@ -7178,7 +7190,7 @@ ngx_http_proxy_v2_read_payload(ngx_http_proxy_v2_stream_t *stream, u_char *buf,
             ngx_http_proxy_v2_release_input(sess);
         }
 
-        /* Completing input can cancel the stream and close the transport. */
+        /* Cancelling the upload can close the transport after END_STREAM. */
 
         if (sess->closing) {
             return n;
