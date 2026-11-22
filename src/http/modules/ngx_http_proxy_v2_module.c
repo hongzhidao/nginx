@@ -7349,13 +7349,52 @@ ngx_http_proxy_v2_init_peer(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
 {
-    ngx_http_upstream_t          *u;
-    ngx_http_proxy_v2_peer_t     *peer;
-    ngx_http_proxy_v2_session_t  *session;
+    ngx_int_t                      rc;
+    ngx_connection_t              *c;
+    ngx_http_upstream_t            *u;
+    ngx_http_proxy_v2_peer_t       *peer;
+    ngx_http_proxy_v2_session_t    *session;
+    ngx_http_proxy_v2_srv_conf_t   *conf;
 
     u = r->upstream;
     peer = u->peer.data;
     session = peer->session;
+
+    if (session == NULL && !u->ssl) {
+        /* Another connection may have become reusable while connecting. */
+
+        c = u->peer.connection;
+        session = ngx_http_proxy_v2_find_session(u);
+
+        if (session) {
+            rc = ngx_http_proxy_v2_create_stream(r, peer, session, 1);
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            if (rc == NGX_OK) {
+                ngx_http_proxy_v2_clear_peer_connection(u, c);
+
+                /* Keep the retiring transport charged until actual close. */
+
+                conf = NULL;
+                if (peer->reserved) {
+                    ngx_queue_remove(&peer->queue);
+                    peer->reserved = 0;
+                    conf = peer->conf;
+                }
+
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, u->peer.log, 0,
+                               "http2 pool consolidating connection %p into %p",
+                               c, session->connection);
+
+                ngx_http_proxy_v2_discard_connection(c, conf);
+
+            } else {
+                session = NULL;
+            }
+        }
+    }
 
     if (session == NULL) {
         session = ngx_http_proxy_v2_create_session(r);
