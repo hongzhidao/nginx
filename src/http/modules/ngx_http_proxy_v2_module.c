@@ -120,8 +120,12 @@ typedef struct {
 
 
 typedef struct {
+    ngx_connection_t               connection;
+    ngx_event_t                    read;
+    ngx_event_t                    write;
     ngx_rbtree_node_t              node;
     ngx_http_proxy_v2_session_t   *session;
+    ngx_http_request_t            *request;
     ngx_uint_t                     id;
 
     size_t                         header_budget;
@@ -204,6 +208,7 @@ static u_char *ngx_http_proxy_v2_alloc_header(ngx_http_request_t *r,
 static ngx_int_t ngx_http_proxy_v2_init_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us);
 static ngx_int_t ngx_http_proxy_v2_init_stream(ngx_http_request_t *r);
+static void ngx_http_proxy_v2_init_endpoint(ngx_http_proxy_v2_stream_t *stream);
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
@@ -5028,7 +5033,6 @@ static ngx_int_t
 ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
 {
     size_t                        budget;
-    ngx_connection_t             *c;
     ngx_http_proxy_v2_peer_t     *peer;
     ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *session;
@@ -5063,16 +5067,20 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
     }
 
     stream->session = session;
+    stream->request = r;
     stream->id = session->last_stream_id ? session->last_stream_id + 2 : 1;
     stream->header_budget = budget;
     stream->send_window = session->init_window;
     stream->recv_window = NGX_HTTP_V2_MAX_WINDOW;
 
-    c = session->connection;
-    c->sendfile &= r->connection->sendfile;
+    ngx_http_proxy_v2_init_endpoint(stream);
+
+    /* The upstream writer still uses the physical connection. */
+
+    session->connection->sendfile = stream->connection.sendfile;
 
     if (r->connection->tcp_nopush == NGX_TCP_NOPUSH_DISABLED) {
-        c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+        session->connection->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
     }
 
     stream->node.key = stream->id;
@@ -5084,6 +5092,44 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
     peer->stream = stream;
 
     return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_init_endpoint(ngx_http_proxy_v2_stream_t *stream)
+{
+    ngx_connection_t    *c, *sc;
+    ngx_http_request_t  *r;
+
+    r = stream->request;
+    c = stream->session->connection;
+    sc = &stream->connection;
+
+    sc->fd = (ngx_socket_t) -1;
+    sc->shared = 1;
+    sc->data = r;
+    sc->pool = r->pool;
+    sc->log = r->connection->log;
+    sc->read = &stream->read;
+    sc->write = &stream->write;
+    sc->sendfile = c->sendfile && r->connection->sendfile;
+    sc->number = c->number;
+    sc->start_time = c->start_time;
+    sc->type = SOCK_STREAM;
+    sc->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+    sc->tcp_nodelay = NGX_TCP_NODELAY_DISABLED;
+
+    sc->read->data = sc;
+    sc->read->log = sc->log;
+    sc->read->index = NGX_INVALID_INDEX;
+    sc->read->available = -1;
+    sc->read->ready = c->read->ready;
+
+    sc->write->data = sc;
+    sc->write->log = sc->log;
+    sc->write->index = NGX_INVALID_INDEX;
+    sc->write->write = 1;
+    sc->write->ready = 1;
 }
 
 
@@ -5103,6 +5149,8 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
     session->nstreams--;
 
     stream->in = NULL;
+    stream->connection.data = NULL;
+    stream->request = NULL;
     stream->session = NULL;
 }
 
