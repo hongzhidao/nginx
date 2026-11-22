@@ -170,6 +170,10 @@ typedef struct {
     ngx_uint_t                                 nactive;
     ngx_uint_t                                 max_streams;
 
+#if (NGX_HTTP_SSL)
+    ngx_str_t                                  ssl_name;  /* completed-handshake lookup */
+#endif
+
     ngx_http_proxy_v2_state_e                  state;
     ngx_uint_t                                 frame_state;
     size_t                                     rest;
@@ -546,9 +550,13 @@ static ngx_http_proxy_v2_stream_t *ngx_http_proxy_v2_find_stream(
     ngx_http_proxy_v2_session_t *session, ngx_uint_t id);
 static ngx_rbtree_key_t ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u);
 static ngx_http_proxy_v2_session_t *
-    ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u);
+    ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u,
+    ngx_connection_t *completed);
 static ngx_int_t ngx_http_proxy_v2_match_session(
     ngx_http_proxy_v2_session_t *session, ngx_http_upstream_t *u);
+static ngx_int_t ngx_http_proxy_v2_match_completed(
+    ngx_http_proxy_v2_session_t *session, ngx_http_upstream_t *u,
+    ngx_connection_t *completed);
 static ngx_int_t ngx_http_proxy_v2_reusable_session(
     ngx_http_proxy_v2_session_t *session, ngx_uint_t reserved);
 static ngx_int_t ngx_http_proxy_v2_stream_capacity(
@@ -7360,11 +7368,11 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
     peer = u->peer.data;
     session = peer->session;
 
-    if (session == NULL && !u->ssl) {
+    if (session == NULL) {
         /* Another connection may have become reusable while connecting. */
 
         c = u->peer.connection;
-        session = ngx_http_proxy_v2_find_session(u);
+        session = ngx_http_proxy_v2_find_session(u, c);
 
         if (session) {
             rc = ngx_http_proxy_v2_create_stream(r, peer, session, 1);
@@ -8008,7 +8016,7 @@ ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u)
 
 
 static ngx_http_proxy_v2_session_t *
-ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u)
+ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u, ngx_connection_t *completed)
 {
     ngx_rbtree_key_t              key;
     ngx_rbtree_node_t            *node, *next, *first, *sentinel;
@@ -8040,7 +8048,10 @@ ngx_http_proxy_v2_find_session(ngx_http_upstream_t *u)
         session = ngx_rbtree_data(node, ngx_http_proxy_v2_session_t, node);
 
         if (session->closing || (!session->idle && session->nstreams == 0)
-            || ngx_http_proxy_v2_match_session(session, u) != NGX_OK)
+            || ngx_http_proxy_v2_match_session(session, u) != NGX_OK
+            || (completed
+                && ngx_http_proxy_v2_match_completed(session, u, completed)
+                   != NGX_OK))
         {
             continue;
         }
@@ -8108,6 +8119,50 @@ ngx_http_proxy_v2_match_session(ngx_http_proxy_v2_session_t *session,
 
 #if (NGX_HTTP_SSL)
     if (u->ssl != (session->connection->ssl != NULL)) {
+        return NGX_DECLINED;
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_match_completed(ngx_http_proxy_v2_session_t *session,
+    ngx_http_upstream_t *u, ngx_connection_t *completed)
+{
+#if (NGX_HTTP_SSL)
+    ngx_str_t  name;
+
+    if (!u->ssl) {
+        return NGX_OK;
+    }
+
+    /*
+     * Only consolidate handshakes whose identity is known without reevaluating
+     * request selectors.  Dynamic credentials and unscoped TLS resumptions do
+     * not provide that guarantee.  Static credentials share the same conf.
+     */
+
+    if ((u->conf->ssl_certificate && u->conf->ssl_certificate->lengths)
+        || (u->conf->ssl_certificate_key
+            && u->conf->ssl_certificate_key->lengths)
+        || SSL_session_reused(completed->ssl->connection)
+        || SSL_session_reused(session->connection->ssl->connection))
+    {
+        return NGX_DECLINED;
+    }
+
+    ngx_str_null(&name);
+
+    if (u->conf->ssl_server_name || u->conf->ssl_verify) {
+        name = u->ssl_name;
+    }
+
+    if (session->ssl_name.len != name.len
+        || (name.len
+            && ngx_memcmp(session->ssl_name.data, name.data, name.len) != 0))
+    {
         return NGX_DECLINED;
     }
 #endif
@@ -8281,6 +8336,20 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
     session = cln->data;
 
     ngx_memzero(session, sizeof(ngx_http_proxy_v2_session_t));
+
+#if (NGX_HTTP_SSL)
+    if (u->ssl && (u->conf->ssl_server_name || u->conf->ssl_verify)
+        && u->ssl_name.len)
+    {
+        session->ssl_name.data = ngx_pnalloc(c->pool, u->ssl_name.len);
+        if (session->ssl_name.data == NULL) {
+            return NULL;
+        }
+
+        session->ssl_name.len = u->ssl_name.len;
+        ngx_memcpy(session->ssl_name.data, u->ssl_name.data, u->ssl_name.len);
+    }
+#endif
 
     if (u->upstream && u->upstream->srv_conf) {
         session->srv_conf = ngx_http_conf_upstream_srv_conf(u->upstream,
@@ -8472,7 +8541,7 @@ ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc, void *data)
         }
     }
 
-    session = ngx_http_proxy_v2_find_session(u);
+    session = ngx_http_proxy_v2_find_session(u, NULL);
     if (session) {
         rc = ngx_http_proxy_v2_create_stream(peer->request, peer, session, 1);
         if (rc == NGX_OK) {
