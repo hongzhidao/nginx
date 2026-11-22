@@ -6179,7 +6179,6 @@ ngx_http_proxy_v2_send_expired(ngx_http_proxy_v2_stream_t *stream)
         && (ngx_msec_int_t) (stream->send_deadline - ngx_current_msec) <= 0)
     {
         ngx_http_proxy_v2_set_failure(stream, NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0);
-        stream->send_expired = 1;
     }
 
     if (stream->send_expired) {
@@ -6706,7 +6705,6 @@ ngx_http_proxy_v2_read_expired(ngx_http_proxy_v2_stream_t *stream)
             && (ngx_msec_int_t) (stream->read_deadline - ngx_current_msec) <= 0))
     {
         ngx_http_proxy_v2_set_failure(stream, NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0);
-        stream->read_expired = 1;
         stream->read.timedout = 1;
         ngx_post_event(&stream->read, &ngx_posted_events);
         return 1;
@@ -6745,15 +6743,14 @@ ngx_http_proxy_v2_read_timer(ngx_http_request_t *r)
 
     sess = stream->session;
 
-    /* Local zero-credit waits cannot suspend framing or END_STREAM waits. */
+    /* Only this stream's framing or END_STREAM overrides its local wait. */
 
     blocked = stream->body_started && stream->recv_window == 0
               && (stream->recv_queued
                   || ngx_event_pipe2_input_capacity(r->upstream->pipe, NULL) == 0)
-              && sess->state == ngx_http_proxy_v2_st_start
-              && (sess->buffer == NULL
-                  || sess->buffer->pos == sess->buffer->last)
-              && !sess->header_stream_id
+              && !(sess->state >= ngx_http_proxy_v2_st_payload
+                   && sess->stream_id == stream->id)
+              && sess->header_stream_id != stream->id
               && stream->length != 0;
 
     if (blocked) {
@@ -6994,7 +6991,7 @@ ngx_http_proxy_v2_read_handler(ngx_event_t *ev)
         ngx_post_event(&stream->read, &ngx_posted_events);
     }
 
-    /* Partial framing can resume a paused wait before its owner is known. */
+    /* Recheck local waits against the current frame and header-block owner. */
 
     if (rc != NGX_ERROR && sess->nstreams) {
         for (node = ngx_rbtree_min(sess->streams.root, sess->streams.sentinel);
@@ -7162,14 +7159,7 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
             return;
         }
 
-        if (ngx_http_proxy_v2_send_expired(stream)) {
-            /* This callback is already delivering the timeout. */
-
-            if (ev->posted) {
-                ngx_delete_posted_event(ev);
-            }
-
-        } else if (ev->timedout) {
+        if (!ngx_http_proxy_v2_send_expired(stream) && ev->timedout) {
             ngx_http_proxy_v2_write_timer(stream->request);
             return;
         }
@@ -7178,10 +7168,6 @@ ngx_http_proxy_v2_stream_handler(ngx_event_t *ev)
     }
 
     if (ngx_http_proxy_v2_read_expired(stream)) {
-        if (ev->posted) {
-            ngx_delete_posted_event(ev);
-        }
-
         goto done;
     }
 
