@@ -255,6 +255,7 @@ typedef struct {
     unsigned                       active:1;
     unsigned                       exited:1;
     unsigned                       reset_sent:1;
+    unsigned                       goaway_excluded:1;
 } ngx_http_proxy_v2_stream_t;
 
 
@@ -2467,12 +2468,21 @@ ngx_http_proxy_v2_record_goaway(ngx_http_proxy_v2_stream_t *stream)
             return NGX_OK;
         }
 
-        if (sess->goaway_last_stream_id < stream->id) {
-            failure = stream->response_received
-                      ? NGX_HTTP_UPSTREAM_FT_INVALID_HEADER
-                      : NGX_HTTP_UPSTREAM_FT_ERROR;
+        if (!stream->header_started
+            || sess->goaway_last_stream_id < stream->id)
+        {
+            if (!stream->failure) {
+                failure = stream->response_received
+                          ? NGX_HTTP_UPSTREAM_FT_INVALID_HEADER
+                          : NGX_HTTP_UPSTREAM_FT_ERROR;
 
-            ngx_http_proxy_v2_set_failure(stream, failure, sess->goaway_error);
+                ngx_http_proxy_v2_set_failure(stream, failure,
+                                              sess->goaway_error);
+
+                stream->goaway_excluded =
+                    (stream->failure == NGX_HTTP_UPSTREAM_FT_ERROR
+                     && sess->goaway_error == 0);
+            }
 
             if (sess->goaway_error || stream->response_received) {
                 ngx_log_error(NGX_LOG_ERR, &sess->log, 0,
@@ -8290,6 +8300,10 @@ ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
     /* module contexts may have been cleared by an internal redirect */
 
     if (stream) {
+        if ((state & NGX_PEER_FAILED) && stream->goaway_excluded) {
+            state = (state & ~NGX_PEER_FAILED) | NGX_PEER_NEXT;
+        }
+
         ngx_http_proxy_v2_detach_stream(stream);
 
         if (peer->ctx->stream == stream) {
