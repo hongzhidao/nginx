@@ -224,6 +224,8 @@ static ngx_int_t ngx_http_proxy_v2_non_buffered_filter(void *data,
     ssize_t bytes);
 static ngx_int_t ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p,
     ngx_buf_t *buf);
+static ngx_int_t ngx_http_proxy_v2_process_frame(
+    ngx_http_proxy_v2_stream_t *stream, ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_skip_frame(ngx_http_proxy_v2_session_t *sess,
@@ -239,6 +241,8 @@ static ngx_int_t ngx_http_proxy_v2_validate_frame(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_admit_header_block(
     ngx_http_proxy_v2_session_t *sess);
+static ngx_int_t ngx_http_proxy_v2_admit_data(ngx_http_proxy_v2_session_t *sess,
+    ngx_http_proxy_v2_stream_t *stream);
 static ngx_int_t ngx_http_proxy_v2_parse_data(
     ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b, size_t *size);
 static ngx_int_t ngx_http_proxy_v2_process_data(
@@ -277,6 +281,8 @@ static ngx_int_t ngx_http_proxy_v2_send_window_update(ngx_http_request_t *r,
 
 static ngx_chain_t *ngx_http_proxy_v2_get_buf(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
+static ngx_http_proxy_v2_stream_t *ngx_http_proxy_v2_find_stream(
+    ngx_http_proxy_v2_session_t *session, ngx_uint_t id);
 static void ngx_http_proxy_v2_detach_stream(
     ngx_http_proxy_v2_stream_t *stream);
 static ngx_rbtree_key_t ngx_http_proxy_v2_session_key(ngx_http_upstream_t *u);
@@ -1693,9 +1699,10 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
 
     for ( ;; ) {
 
-        if (sess->state < ngx_http_proxy_v2_st_payload) {
+        p = NULL;
 
-            /* Retain an incomplete initial frame header in the buffer. */
+        if (sess->state < ngx_http_proxy_v2_st_payload) {
+            /* Retain an incomplete initial frame header for the cache. */
 
             if (!sess->header_stream_id
                 && b->last - b->pos < NGX_HTTP_V2_FRAME_HEADER_SIZE)
@@ -1704,65 +1711,9 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
             }
 
             p = b->pos;
-            rc = ngx_http_proxy_v2_parse_frame(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                goto again;
-            }
-
-            if (rc == NGX_ERROR) {
-                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-            }
-
-            /* DATA frames cannot appear before the response headers. */
-
-            if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent unexpected http2 frame: %d",
-                              sess->type);
-                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-            }
-
-            if (sess->stream_id && sess->stream_id != stream->id) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for unknown stream %ui",
-                              sess->stream_id);
-                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-            }
-
-            if (sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
-                /* Reclaim controls preceding headers in the same read. */
-
-                size = b->pos - p;
-                b->last = ngx_movemem(pos, p, b->last - p);
-                b->pos = pos + size;
-            }
         }
 
-        /* frame payload */
-
-        if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
-            rc = ngx_http_proxy_v2_parse_rst_stream(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                goto again;
-            }
-
-            if (rc == NGX_ERROR) {
-                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-            }
-
-            stream->error = sess->error;
-            stream->rst = 1;
-
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "upstream rejected request with error %ui",
-                          stream->error);
-
-            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-        }
-
-        rc = ngx_http_proxy_v2_process_control_frame(r, ctx, b);
+        rc = ngx_http_proxy_v2_process_frame(stream, b);
 
         if (rc == NGX_AGAIN) {
             goto again;
@@ -1776,22 +1727,23 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
             return NGX_HTTP_UPSTREAM_INVALID_HEADER;
         }
 
+        if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "upstream sent unexpected http2 frame: %d",
+                          sess->type);
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
         if (rc == NGX_OK) {
             continue;
         }
 
-        if (sess->type != NGX_HTTP_V2_HEADERS_FRAME
-            && sess->type != NGX_HTTP_V2_CONTINUATION_FRAME)
-        {
-            /* priority, unknown frames */
+        if (p && sess->type == NGX_HTTP_V2_HEADERS_FRAME) {
+            /* Reclaim controls preceding headers in the same read. */
 
-            rc = ngx_http_proxy_v2_skip_frame(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                goto again;
-            }
-
-            continue;
+            size = b->pos - p;
+            b->last = ngx_movemem(pos, p, b->last - p);
+            b->pos = pos + size;
         }
 
         /* headers */
@@ -2531,6 +2483,87 @@ ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p, ngx_buf_t *b)
 
 
 static ngx_int_t
+ngx_http_proxy_v2_process_frame(ngx_http_proxy_v2_stream_t *stream, ngx_buf_t *b)
+{
+    ngx_int_t                     rc;
+    ngx_http_request_t           *r;
+    ngx_http_proxy_v2_ctx_t      *ctx;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    sess = stream->session;
+    r = stream->request;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+
+    if (sess->state < ngx_http_proxy_v2_st_payload) {
+        rc = ngx_http_proxy_v2_parse_frame(sess, b);
+        if (rc != NGX_OK) {
+            return rc;
+        }
+
+        sess->padding = 0;
+    }
+
+    if (sess->stream_id
+        && ngx_http_proxy_v2_find_stream(sess, sess->stream_id) != stream)
+    {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream sent frame for unknown stream %ui",
+                      sess->stream_id);
+        return NGX_ERROR;
+    }
+
+    if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
+        rc = ngx_http_proxy_v2_parse_rst_stream(sess, b);
+        if (rc != NGX_OK) {
+            return rc;
+        }
+
+        if (stream->rst) {
+            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                          "upstream sent frame for closed stream %ui",
+                          sess->stream_id);
+            return NGX_ERROR;
+        }
+
+        stream->rst = 1;
+        stream->error = sess->error;
+
+        if (stream->error || !stream->input_closed) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "upstream rejected request with error %ui",
+                          stream->error);
+            return NGX_ERROR;
+        }
+
+        return NGX_OK;
+    }
+
+    if (sess->stream_id && stream->input_closed
+        && sess->type != NGX_HTTP_V2_WINDOW_UPDATE_FRAME)
+    {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream sent frame for closed stream %ui",
+                      sess->stream_id);
+        return NGX_ERROR;
+    }
+
+    rc = ngx_http_proxy_v2_process_control_frame(r, ctx, b);
+    if (rc != NGX_DECLINED) {
+        return rc;
+    }
+
+    if (sess->type == NGX_HTTP_V2_HEADERS_FRAME
+        || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME
+        || sess->type == NGX_HTTP_V2_DATA_FRAME)
+    {
+        return NGX_DECLINED;
+    }
+
+    return ngx_http_proxy_v2_skip_frame(sess, b);
+}
+
+
+static ngx_int_t
 ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b)
 {
@@ -2777,127 +2810,19 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
 
     for ( ;; ) {
 
-        if (sess->state < ngx_http_proxy_v2_st_payload) {
-
-            rc = ngx_http_proxy_v2_parse_frame(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                return stream->input_closed ? NGX_DONE : NGX_AGAIN;
-            }
-
-            if (rc == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-
-            if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
-
-                if (sess->stream_id != stream->id) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                  "upstream sent data frame "
-                                  "for unknown stream %ui",
-                                  sess->stream_id);
-                    return NGX_ERROR;
-                }
-
-                if (sess->rest > stream->recv_window) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                  "upstream violated stream flow control, "
-                                  "received %uz data frame with window %uz",
-                                  sess->rest, stream->recv_window);
-                    return NGX_ERROR;
-                }
-
-                if (sess->rest > sess->recv_window) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                  "upstream violated connection flow control, "
-                                  "received %uz data frame with window %uz",
-                                  sess->rest, sess->recv_window);
-                    return NGX_ERROR;
-                }
-
-                stream->recv_window -= sess->rest;
-                sess->recv_window -= sess->rest;
-
-                if (sess->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4
-                    || stream->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4)
-                {
-                    if (ngx_http_proxy_v2_send_window_update(r, ctx)
-                        != NGX_OK)
-                    {
-                        return NGX_ERROR;
-                    }
-
-                    ngx_post_event(u->peer.connection->write,
-                                   &ngx_posted_events);
-                }
-            }
-
-            if (sess->stream_id && sess->stream_id != stream->id) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for unknown stream %ui",
-                              sess->stream_id);
-                return NGX_ERROR;
-            }
-
-            if (sess->stream_id && stream->input_closed
-                && sess->type != NGX_HTTP_V2_RST_STREAM_FRAME
-                && sess->type != NGX_HTTP_V2_WINDOW_UPDATE_FRAME)
-            {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for closed stream %ui",
-                              sess->stream_id);
-                return NGX_ERROR;
-            }
-
-            sess->padding = 0;
-        }
-
-        /* frame payload */
-
-        if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
-
-            rc = ngx_http_proxy_v2_parse_rst_stream(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                return NGX_AGAIN;
-            }
-
-            if (rc == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-
-            if (stream->rst) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream sent frame for closed stream %ui",
-                              sess->stream_id);
-                return NGX_ERROR;
-            }
-
-            stream->error = sess->error;
-            stream->rst = 1;
-
-            if (stream->error || !stream->input_closed) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "upstream rejected request with error %ui",
-                              stream->error);
-                return NGX_ERROR;
-            }
-
-            continue;
-        }
-
-        rc = ngx_http_proxy_v2_process_control_frame(r, ctx, b);
+        rc = ngx_http_proxy_v2_process_frame(stream, b);
 
         if (rc == NGX_AGAIN) {
-            return NGX_AGAIN;
-        }
-
-        if (rc == NGX_ERROR || rc == NGX_HTTP_UPSTREAM_CONNECTION_ERROR) {
-            return NGX_ERROR;
+            return stream->input_closed && sess->state < ngx_http_proxy_v2_st_payload
+                   ? NGX_DONE : NGX_AGAIN;
         }
 
         if (rc == NGX_OK) {
             continue;
+        }
+
+        if (rc != NGX_DECLINED) {
+            return NGX_ERROR;
         }
 
         if (sess->type == NGX_HTTP_V2_HEADERS_FRAME
@@ -2986,17 +2911,20 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
             return NGX_AGAIN;
         }
 
-        if (sess->type != NGX_HTTP_V2_DATA_FRAME) {
-
-            /* priority, unknown frames */
-
-            rc = ngx_http_proxy_v2_skip_frame(sess, b);
-
-            if (rc == NGX_AGAIN) {
-                return NGX_AGAIN;
+        if (sess->frame_state == 0) {
+            if (ngx_http_proxy_v2_admit_data(sess, stream) != NGX_OK) {
+                return NGX_ERROR;
             }
 
-            continue;
+            if (sess->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4
+                || stream->recv_window < NGX_HTTP_V2_MAX_WINDOW / 4)
+            {
+                if (ngx_http_proxy_v2_send_window_update(r, ctx) != NGX_OK) {
+                    return NGX_ERROR;
+                }
+
+                ngx_post_event(u->peer.connection->write, &ngx_posted_events);
+            }
         }
 
         rc = ngx_http_proxy_v2_parse_data(sess, b, size);
@@ -3012,6 +2940,44 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
 
         return rc;
     }
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_admit_data(ngx_http_proxy_v2_session_t *sess,
+    ngx_http_proxy_v2_stream_t *stream)
+{
+    /* Admission survives partial reads and detachment of the consumer. */
+
+    if (sess->frame_state) {
+        return NGX_OK;
+    }
+
+    if (stream && sess->rest > stream->recv_window) {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream violated stream flow control, "
+                      "received %uz data frame with window %uz",
+                      sess->rest, stream->recv_window);
+        return NGX_ERROR;
+    }
+
+    if (sess->rest > sess->recv_window) {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream violated connection flow control, "
+                      "received %uz data frame with window %uz",
+                      sess->rest, sess->recv_window);
+        return NGX_ERROR;
+    }
+
+    if (stream) {
+        stream->recv_window -= sess->rest;
+    }
+
+    sess->recv_window -= sess->rest;
+    sess->frame_state = 1;
+    sess->padding = 0;
+
+    return NGX_OK;
 }
 
 
@@ -5152,6 +5118,30 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
     stream->connection.data = NULL;
     stream->request = NULL;
     stream->session = NULL;
+}
+
+
+static ngx_http_proxy_v2_stream_t *
+ngx_http_proxy_v2_find_stream(ngx_http_proxy_v2_session_t *session, ngx_uint_t id)
+{
+    ngx_rbtree_node_t  *node, *sentinel;
+
+    node = session->streams.root;
+    sentinel = session->streams.sentinel;
+
+    while (node != sentinel) {
+        if (id < node->key) {
+            node = node->left;
+
+        } else if (id > node->key) {
+            node = node->right;
+
+        } else {
+            return ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+        }
+    }
+
+    return NULL;
 }
 
 
