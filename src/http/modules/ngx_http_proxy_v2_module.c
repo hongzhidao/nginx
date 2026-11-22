@@ -224,6 +224,7 @@ typedef struct {
     unsigned                                   finishing:1;
     unsigned                                   transparent:1;
     unsigned                                   so_keepalive:1;
+    unsigned                                   tcp_nodelay:1;
 } ngx_http_proxy_v2_session_t;
 
 
@@ -548,6 +549,8 @@ static ngx_int_t ngx_http_proxy_v2_retain_session(
     ngx_http_proxy_v2_session_t *session);
 static ngx_http_proxy_v2_session_t *
     ngx_http_proxy_v2_create_session(ngx_http_request_t *r);
+static void ngx_http_proxy_v2_init_session(
+    ngx_http_proxy_v2_session_t *session);
 static u_char *ngx_http_proxy_v2_log_error(ngx_log_t *log, u_char *buf,
     size_t len);
 static void ngx_http_proxy_v2_close_connection(ngx_connection_t *c);
@@ -6312,6 +6315,7 @@ ngx_http_proxy_v2_cancel_output(ngx_http_proxy_v2_stream_t *stream)
 static ngx_int_t
 ngx_http_proxy_v2_writer(ngx_http_proxy_v2_session_t *sess)
 {
+    int                tcp_nodelay;
     ngx_int_t          rc;
     ngx_connection_t  *c;
 
@@ -6336,7 +6340,11 @@ ngx_http_proxy_v2_writer(ngx_http_proxy_v2_session_t *sess)
         return NGX_ERROR;
     }
 
-    if (c->write->ready && c->tcp_nopush == NGX_TCP_NOPUSH_SET) {
+    if (!c->write->ready) {
+        return rc;
+    }
+
+    if (c->tcp_nopush == NGX_TCP_NOPUSH_SET) {
         if (ngx_tcp_push(c->fd) == -1) {
             ngx_log_error(NGX_LOG_CRIT, &sess->log, ngx_socket_errno,
                           ngx_tcp_push_n " failed");
@@ -6345,6 +6353,15 @@ ngx_http_proxy_v2_writer(ngx_http_proxy_v2_session_t *sess)
         }
 
         c->tcp_nopush = NGX_TCP_NOPUSH_UNSET;
+        tcp_nodelay = ngx_tcp_nodelay_and_tcp_nopush ? 1 : 0;
+
+    } else {
+        tcp_nodelay = 1;
+    }
+
+    if (tcp_nodelay && sess->tcp_nodelay && ngx_tcp_nodelay(c) != NGX_OK) {
+        c->error = 1;
+        return NGX_ERROR;
     }
 
     return rc;
@@ -7623,7 +7640,6 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
 {
     size_t                        budget;
     ngx_int_t                     rc;
-    ngx_connection_t             *c;
     ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *session;
 
@@ -7678,16 +7694,6 @@ ngx_http_proxy_v2_create_stream(ngx_http_request_t *r,
 
     ngx_http_proxy_v2_init_endpoint(stream);
 
-    c = session->connection;
-
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
-
-    if (c->write->timer_set) {
-        ngx_del_timer(c->write);
-    }
-
     return NGX_OK;
 }
 
@@ -7721,7 +7727,7 @@ ngx_http_proxy_v2_init_endpoint(ngx_http_proxy_v2_stream_t *stream)
     sc->read->log = sc->log;
     sc->read->index = NGX_INVALID_INDEX;
     sc->read->available = -1;
-    sc->read->ready = c->read->ready;
+    sc->read->ready = 0;
     sc->read->handler = ngx_http_proxy_v2_stream_handler;
 
     sc->write->data = sc;
@@ -8164,6 +8170,12 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
     session->so_keepalive = pc->so_keepalive;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    session->tcp_nodelay = clcf->tcp_nodelay && !u->conf->request_buffering;
+
+    if (!clcf->tcp_nopush) {
+        c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+    }
+
     session->log = *clcf->error_log;
     session->log.connection = c->number;
     session->log.handler = ngx_http_proxy_v2_log_error;
@@ -8224,6 +8236,27 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
     ngx_rbtree_insert(&ngx_http_proxy_v2_sessions, &session->node);
     session->registered = 1;
 
+    ngx_http_proxy_v2_init_session(session);
+
+    return session;
+}
+
+
+static void
+ngx_http_proxy_v2_init_session(ngx_http_proxy_v2_session_t *session)
+{
+    ngx_connection_t  *c;
+
+    c = session->connection;
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+
     c->data = session;
     c->log = &session->log;
     c->pool->log = c->log;
@@ -8238,16 +8271,14 @@ ngx_http_proxy_v2_create_session(ngx_http_request_t *r)
 #if (NGX_HTTP_SSL)
     if (c->ssl) {
         c->ssl->handler = NULL;
-        c->ssl->save_session = u->conf->ssl_session_reuse
+        c->ssl->save_session = session->conf->ssl_session_reuse
                               ? ngx_http_proxy_v2_ssl_save_session : NULL;
     }
 #endif
 
-    session->output_deadline = ngx_current_msec + u->conf->send_timeout;
-    ngx_add_timer(&session->output_timer, u->conf->send_timeout);
+    session->output_deadline = ngx_current_msec + session->conf->send_timeout;
+    ngx_add_timer(&session->output_timer, session->conf->send_timeout);
     ngx_post_event(&session->write, &ngx_posted_next_events);
-
-    return session;
 }
 
 
