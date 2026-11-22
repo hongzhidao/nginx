@@ -54,6 +54,7 @@ typedef enum {
 typedef struct {
     ngx_queue_t                    idle;
     ngx_uint_t                     nconns;
+    ngx_uint_t                     max_conns;
 } ngx_http_proxy_v2_srv_conf_t;
 
 
@@ -579,7 +580,7 @@ static void ngx_http_proxy_v2_idle_session(ngx_http_proxy_v2_session_t *session)
 static void ngx_http_proxy_v2_idle_timeout(ngx_event_t *ev);
 static ngx_int_t ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc,
     void *data);
-static void ngx_http_proxy_v2_reserve_connection(ngx_http_upstream_t *u);
+static ngx_int_t ngx_http_proxy_v2_reserve_connection(ngx_http_upstream_t *u);
 static void ngx_http_proxy_v2_release_connection(
     ngx_http_proxy_v2_srv_conf_t *conf);
 static void ngx_http_proxy_v2_free_peer(ngx_peer_connection_t *pc, void *data,
@@ -605,6 +606,19 @@ static ngx_int_t ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle);
 static void ngx_http_proxy_v2_exit_process(ngx_cycle_t *cycle);
 
 
+static ngx_command_t  ngx_http_proxy_v2_commands[] = {
+
+    { ngx_string("proxy_http2_max_conns"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_proxy_v2_srv_conf_t, max_conns),
+      NULL },
+
+      ngx_null_command
+};
+
+
 static ngx_http_module_t  ngx_http_proxy_v2_module_ctx = {
     NULL,                                  /* preconfiguration */
     NULL,                                  /* postconfiguration */
@@ -623,7 +637,7 @@ static ngx_http_module_t  ngx_http_proxy_v2_module_ctx = {
 ngx_module_t  ngx_http_proxy_v2_module = {
     NGX_MODULE_V1,
     &ngx_http_proxy_v2_module_ctx,         /* module context */
-    NULL,                                  /* module directives */
+    ngx_http_proxy_v2_commands,            /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
     NULL,                                  /* init module */
@@ -8429,23 +8443,37 @@ ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc, void *data)
         }
     }
 
-    ngx_http_proxy_v2_reserve_connection(u);
-
-    return NGX_OK;
+    return ngx_http_proxy_v2_reserve_connection(u);
 }
 
 
-static void
+static ngx_int_t
 ngx_http_proxy_v2_reserve_connection(ngx_http_upstream_t *u)
 {
+    ngx_queue_t                   *q;
     ngx_http_proxy_v2_peer_t      *peer;
+    ngx_http_proxy_v2_session_t   *session;
     ngx_http_proxy_v2_srv_conf_t  *conf;
 
     peer = u->peer.data;
     conf = peer->conf;
 
     if (conf == NULL) {
-        return;
+        return NGX_OK;
+    }
+
+    while (conf->max_conns != NGX_CONF_UNSET_UINT && conf->max_conns
+           && conf->nconns >= conf->max_conns)
+    {
+        if (ngx_queue_empty(&conf->idle)) {
+            ngx_log_error(NGX_LOG_ERR, u->peer.log, 0,
+                          "http2 upstream connection pool is full");
+            return NGX_ERROR;
+        }
+
+        q = ngx_queue_last(&conf->idle);
+        session = ngx_queue_data(q, ngx_http_proxy_v2_session_t, queue);
+        ngx_http_proxy_v2_close_session(session);
     }
 
     conf->nconns++;
@@ -8454,6 +8482,8 @@ ngx_http_proxy_v2_reserve_connection(ngx_http_upstream_t *u)
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, u->peer.log, 0,
                    "http2 pool reserve connection: %ui", conf->nconns);
+
+    return NGX_OK;
 }
 
 
@@ -9019,6 +9049,7 @@ ngx_http_proxy_v2_create_srv_conf(ngx_conf_t *cf)
     }
 
     ngx_queue_init(&conf->idle);
+    conf->max_conns = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
