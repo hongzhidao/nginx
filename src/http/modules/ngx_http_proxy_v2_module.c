@@ -555,6 +555,12 @@ static void ngx_http_proxy_v2_init_session(
 static u_char *ngx_http_proxy_v2_log_error(ngx_log_t *log, u_char *buf,
     size_t len);
 static void ngx_http_proxy_v2_close_connection(ngx_connection_t *c);
+static ngx_int_t ngx_http_proxy_v2_shutdown(ngx_connection_t *c,
+    ngx_connection_handler_pt handler);
+static void ngx_http_proxy_v2_discard_connection(ngx_connection_t *c);
+static void ngx_http_proxy_v2_close_peer_connection(ngx_connection_t *c);
+static void ngx_http_proxy_v2_clear_peer_connection(ngx_http_upstream_t *u,
+    ngx_connection_t *c);
 static void ngx_http_proxy_v2_close_session(ngx_http_proxy_v2_session_t *session);
 static void ngx_http_proxy_v2_release_session(
     ngx_http_proxy_v2_session_t *session);
@@ -623,6 +629,7 @@ ngx_module_t  ngx_http_proxy_v2_module = {
 static ngx_rbtree_t       ngx_http_proxy_v2_sessions;
 static ngx_rbtree_node_t  ngx_http_proxy_v2_sessions_sentinel;
 static ngx_queue_t        ngx_http_proxy_v2_sessions_queue;
+static ngx_queue_t        ngx_http_proxy_v2_closing;
 
 
 static u_char  ngx_http_proxy_v2_connection_start[] =
@@ -7310,7 +7317,6 @@ ngx_http_proxy_v2_init_peer(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
 {
-    ngx_connection_t             *c;
     ngx_http_upstream_t          *u;
     ngx_http_proxy_v2_peer_t     *peer;
     ngx_http_proxy_v2_session_t  *session;
@@ -7331,13 +7337,7 @@ ngx_http_proxy_v2_init_stream(ngx_http_request_t *r)
             if (peer->session == NULL) {
                 /* No stream owns the newly adopted transport on failure. */
 
-                c = session->connection;
-                u->peer.connection = NULL;
-
-                if (u->writer.connection == c) {
-                    u->writer.connection = NULL;
-                }
-
+                ngx_http_proxy_v2_clear_peer_connection(u, session->connection);
                 ngx_http_proxy_v2_close_session(session);
             }
 
@@ -8385,16 +8385,7 @@ ngx_http_proxy_v2_get_peer(ngx_peer_connection_t *pc, void *data)
         pc->cached = 0;
 
         if (c) {
-            c->data = NULL;
-            c->log = ngx_cycle->log;
-            c->read->log = c->log;
-            c->write->log = c->log;
-
-            if (c->pool) {
-                c->pool->log = c->log;
-            }
-
-            ngx_http_proxy_v2_close_connection(c);
+            ngx_http_proxy_v2_discard_connection(c);
         }
     }
 
@@ -8433,6 +8424,24 @@ ngx_http_proxy_v2_remove_idle(ngx_http_proxy_v2_session_t *session)
 #endif
         session->idle = 0;
         session->connection->idle = 0;
+    }
+}
+
+
+static void
+ngx_http_proxy_v2_clear_peer_connection(ngx_http_upstream_t *u,
+    ngx_connection_t *c)
+{
+    if (u->peer.connection == c) {
+        u->peer.connection = NULL;
+    }
+
+    if (u->writer.connection == c) {
+        u->writer.connection = NULL;
+    }
+
+    if (u->pipe && u->pipe->upstream == c) {
+        u->pipe->upstream = NULL;
     }
 }
 
@@ -8505,39 +8514,70 @@ ngx_http_proxy_v2_close_session(ngx_http_proxy_v2_session_t *session)
 static void
 ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
 {
-    ngx_pool_t                   *pool;
     ngx_chain_t                  *cl;
     ngx_http_proxy_v2_session_t  *session;
 
     session = c->data;
 
-    if (session) {
-        ngx_http_proxy_v2_remove_idle(session);
+    ngx_http_proxy_v2_remove_idle(session);
 
-        session->input_blocked = 0;
+    session->input_blocked = 0;
 
-        if (session->input_reply) {
-            ngx_http_proxy_v2_free_control(session, session->input_reply, 0);
-            session->input_reply = NULL;
-        }
-
-        if (session->read.posted) {
-            ngx_delete_posted_event(&session->read);
-        }
-
-        if (session->write.posted) {
-            ngx_delete_posted_event(&session->write);
-        }
-
-        if (session->control_timer.timer_set) {
-            ngx_del_timer(&session->control_timer);
-        }
-
-        if (session->output_timer.timer_set) {
-            ngx_del_timer(&session->output_timer);
-        }
+    if (session->input_reply) {
+        ngx_http_proxy_v2_free_control(session, session->input_reply, 0);
+        session->input_reply = NULL;
     }
 
+    if (session->read.posted) {
+        ngx_delete_posted_event(&session->read);
+    }
+
+    if (session->write.posted) {
+        ngx_delete_posted_event(&session->write);
+    }
+
+    if (session->control_timer.timer_set) {
+        ngx_del_timer(&session->control_timer);
+    }
+
+    if (session->output_timer.timer_set) {
+        ngx_del_timer(&session->output_timer);
+    }
+
+    if (ngx_http_proxy_v2_shutdown(c, ngx_http_proxy_v2_close_connection)
+        == NGX_AGAIN)
+    {
+        return;
+    }
+
+    ngx_http_proxy_v2_free_output(session);
+
+    while (session->control) {
+        cl = session->control;
+        session->control = cl->next;
+        ngx_http_proxy_v2_free_control(session,
+                                      (ngx_http_proxy_v2_control_t *) cl, 0);
+    }
+
+    session->control_last = &session->control;
+
+    if (!session->preface_sent) {
+        session->recv_queued -= NGX_HTTP_V2_MAX_WINDOW
+                                - NGX_HTTP_V2_DEFAULT_WINDOW;
+    }
+
+    ngx_close_connection(c);
+
+    session->connection = NULL;
+
+    ngx_http_proxy_v2_session_cleanup(session);
+    ngx_http_proxy_v2_release_session(session);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_shutdown(ngx_connection_t *c, ngx_connection_handler_pt handler)
+{
     if (c->read->timer_set) {
         ngx_del_timer(c->read);
     }
@@ -8555,47 +8595,57 @@ ngx_http_proxy_v2_close_connection(ngx_connection_t *c)
     }
 
 #if (NGX_HTTP_SSL)
-
     if (c->ssl) {
         c->ssl->save_session = NULL;
         c->ssl->no_wait_shutdown = 1;
         c->ssl->no_send_shutdown = 1;
 
         if (ngx_ssl_shutdown(c) == NGX_AGAIN) {
-            c->ssl->handler = ngx_http_proxy_v2_close_connection;
-            return;
+            c->ssl->handler = handler;
+            return NGX_AGAIN;
         }
     }
-
 #endif
 
-    if (session) {
-        ngx_http_proxy_v2_free_output(session);
+    return NGX_OK;
+}
 
-        while (session->control) {
-            cl = session->control;
-            session->control = cl->next;
-            ngx_http_proxy_v2_free_control(session,
-                                          (ngx_http_proxy_v2_control_t *) cl, 0);
-        }
 
-        session->control_last = &session->control;
+static void
+ngx_http_proxy_v2_discard_connection(ngx_connection_t *c)
+{
+    ngx_reusable_connection(c, 0);
+    ngx_queue_insert_tail(&ngx_http_proxy_v2_closing, &c->queue);
 
-        if (!session->preface_sent) {
-            session->recv_queued -= NGX_HTTP_V2_MAX_WINDOW
-                                    - NGX_HTTP_V2_DEFAULT_WINDOW;
-        }
+    c->data = NULL;
+    c->log = ngx_cycle->log;
+    c->read->log = c->log;
+    c->write->log = c->log;
+
+    if (c->pool) {
+        c->pool->log = c->log;
+    }
+
+    ngx_http_proxy_v2_close_peer_connection(c);
+}
+
+
+static void
+ngx_http_proxy_v2_close_peer_connection(ngx_connection_t *c)
+{
+    ngx_pool_t  *pool;
+
+    if (ngx_http_proxy_v2_shutdown(c, ngx_http_proxy_v2_close_peer_connection)
+        == NGX_AGAIN)
+    {
+        return;
     }
 
     pool = c->pool;
+    ngx_queue_remove(&c->queue);
     ngx_close_connection(c);
 
-    if (session) {
-        session->connection = NULL;
-        ngx_http_proxy_v2_session_cleanup(session);
-        ngx_http_proxy_v2_release_session(session);
-
-    } else if (pool) {
+    if (pool) {
         ngx_destroy_pool(pool);
     }
 }
@@ -8897,6 +8947,7 @@ ngx_http_proxy_v2_init_process(ngx_cycle_t *cycle)
                     ngx_rbtree_insert_value);
 
     ngx_queue_init(&ngx_http_proxy_v2_sessions_queue);
+    ngx_queue_init(&ngx_http_proxy_v2_closing);
 
     return NGX_OK;
 }
@@ -8950,5 +9001,21 @@ ngx_http_proxy_v2_exit_process(ngx_cycle_t *cycle)
         }
 
         ngx_http_proxy_v2_release_session(session);
+    }
+
+    while (!ngx_queue_empty(&ngx_http_proxy_v2_closing)) {
+        q = ngx_queue_head(&ngx_http_proxy_v2_closing);
+        c = ngx_queue_data(q, ngx_connection_t, queue);
+
+#if (NGX_HTTP_SSL)
+        if (c->ssl) {
+            c->ssl->save_session = NULL;
+            ngx_ssl_ocsp_cleanup(c);
+            SSL_free(c->ssl->connection);
+            c->ssl = NULL;
+        }
+#endif
+
+        ngx_http_proxy_v2_close_peer_connection(c);
     }
 }
