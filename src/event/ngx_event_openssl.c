@@ -3065,6 +3065,44 @@ ngx_ssl_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
                 continue;
             }
 
+            if (!ngx_buf_in_memory(in->buf)) {
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "bad buf in SSL output chain "
+                              "t:%d r:%d f:%d %p %p-%p %p %O-%O",
+                              in->buf->temporary,
+                              in->buf->recycled,
+                              in->buf->in_file,
+                              in->buf->start,
+                              in->buf->pos,
+                              in->buf->last,
+                              in->buf->file,
+                              in->buf->file_pos,
+                              in->buf->file_last);
+
+                ngx_debug_point();
+
+                return NGX_CHAIN_ERROR;
+            }
+
+            if (in->buf->last < in->buf->pos) {
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "negative size buf in SSL output chain "
+                              "t:%d r:%d f:%d %p %p-%p %p %O-%O",
+                              in->buf->temporary,
+                              in->buf->recycled,
+                              in->buf->in_file,
+                              in->buf->start,
+                              in->buf->pos,
+                              in->buf->last,
+                              in->buf->file,
+                              in->buf->file_pos,
+                              in->buf->file_last);
+
+                ngx_debug_point();
+
+                return NGX_CHAIN_ERROR;
+            }
+
             n = ngx_ssl_write(c, in->buf->pos, in->buf->last - in->buf->pos);
 
             if (n == NGX_ERROR) {
@@ -3132,6 +3170,44 @@ ngx_ssl_send_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
             if (in->buf->in_file && c->ssl->sendfile) {
                 flush = 1;
                 break;
+            }
+
+            if (!ngx_buf_in_memory(in->buf)) {
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "bad buf in SSL output chain "
+                              "t:%d r:%d f:%d %p %p-%p %p %O-%O",
+                              in->buf->temporary,
+                              in->buf->recycled,
+                              in->buf->in_file,
+                              in->buf->start,
+                              in->buf->pos,
+                              in->buf->last,
+                              in->buf->file,
+                              in->buf->file_pos,
+                              in->buf->file_last);
+
+                ngx_debug_point();
+
+                return NGX_CHAIN_ERROR;
+            }
+
+            if (in->buf->last < in->buf->pos) {
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "negative size buf in SSL output chain "
+                              "t:%d r:%d f:%d %p %p-%p %p %O-%O",
+                              in->buf->temporary,
+                              in->buf->recycled,
+                              in->buf->in_file,
+                              in->buf->start,
+                              in->buf->pos,
+                              in->buf->last,
+                              in->buf->file,
+                              in->buf->file_pos,
+                              in->buf->file_last);
+
+                ngx_debug_point();
+
+                return NGX_CHAIN_ERROR;
             }
 
             size = in->buf->last - in->buf->pos;
@@ -5699,6 +5775,15 @@ ngx_ssl_get_curve(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 
     int          nid;
     const char  *name;
+
+#if (OPENSSL_VERSION_NUMBER < 0x30500000L)
+
+    if (SSL_get0_session(c->ssl->connection) == NULL) {
+        s->len = 0;
+        return NGX_OK;
+    }
+
+#endif
 
     nid = SSL_get_negotiated_group(c->ssl->connection);
 
